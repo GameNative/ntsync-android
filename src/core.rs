@@ -1708,10 +1708,6 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
     }
 }
 
-/// Free all objects created by processes that no longer exist, and purge
-/// waiter nodes left behind by dead waiters. Userspace has no fd-close-on-
-/// death hook, so callers (e.g. a launcher or wineserver replacement)
-/// should run this after a process exits.
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -1720,41 +1716,197 @@ fn pid_alive(pid: u32) -> bool {
     !(ret != 0 && errno() == libc::ESRCH)
 }
 
-/// Body of sweep_dead with the region lock already held. Returns the
-/// number of objects freed.
-fn sweep_dead_locked(r: &Region) -> u32 {
-    // Purge nodes of dead waiters first so freed objects have empty lists.
-    // Only nodes below node_fresh were ever handed out; the rest have
-    // never been touched (registered == 0 by virtue of sparse zero pages).
-    let node_hi = r.header().node_fresh.min(NODE_COUNT);
-    for i in 0..node_hi {
-        let node = r.node_ptr(i);
-        unsafe {
-            if (*node).registered != 0 && !pid_alive((*node).pid) {
-                node_detach(r, i);
+/// A dead-owner reaping candidate found by `SweepScan::next_chunk`, carried
+/// across the lock-drop in `auto_sweep_dead` so the liveness probe (a
+/// `kill(2)` syscall) runs OUTSIDE the region lock. `generation` is only
+/// meaningful for a slot (it detects the slot being freed and reallocated
+/// while unlocked).
+struct DeadCand {
+    node: bool,
+    index: u32,
+    pid: u32,
+    generation: u32,
+}
+
+/// Candidates per chunk: bounds both the memory a sweep holds while the
+/// region lock is held and the span it spends unlocked probing liveness.
+const SWEEP_CHUNK: usize = 256;
+
+/// Cursor over one sweep's candidates. Waiter nodes are visited before
+/// object slots, so every dead waiter is detached before a dead object's
+/// slot is freed and recycled with an empty waiter list.
+struct SweepScan {
+    node_hi: u32,
+    slot_hi: u32,
+    next_node: u32,
+    next_slot: u32,
+}
+
+impl SweepScan {
+    /// Snapshot the ranges that were ever handed out. Caller holds the region
+    /// lock; the ranges only grow behind it, so objects created during the
+    /// pass are left to the next one.
+    fn new(r: &Region) -> Self {
+        let header = r.header();
+        // Only nodes below node_fresh were ever handed out; the rest have
+        // never been touched (registered == 0 by virtue of sparse zero pages).
+        // Only slots below the allocation cursor were ever handed out — until
+        // the cursor wraps (SCAN_WRAPPED), higher slots are sparse zero pages
+        // that must not be faulted in just to discover pid == 0.
+        let slot_hi = if header.next_scan & SCAN_WRAPPED != 0 {
+            SLOT_COUNT
+        } else {
+            header.next_scan
+        };
+        Self {
+            node_hi: header.node_fresh.min(NODE_COUNT),
+            slot_hi,
+            next_node: 0,
+            next_slot: 0,
+        }
+    }
+
+    /// Fill `out` with the next chunk of candidates: nodes and slots whose
+    /// owner pid MIGHT be dead. Runs NO syscall, so the caller can drop the
+    /// region lock before probing liveness. A full `out` may or may not end
+    /// the scan; an empty one always does. Caller holds the region lock.
+    fn next_chunk(&mut self, r: &Region, out: &mut Vec<DeadCand>) {
+        out.clear();
+        while out.len() < SWEEP_CHUNK {
+            if self.next_node < self.node_hi {
+                let index = self.next_node;
+                self.next_node += 1;
+                let node = r.node_ptr(index);
+                unsafe {
+                    if (*node).registered != 0 {
+                        out.push(DeadCand {
+                            node: true,
+                            index,
+                            pid: (*node).pid,
+                            generation: 0,
+                        });
+                    }
+                }
+            } else if self.next_slot < self.slot_hi {
+                let index = self.next_slot;
+                self.next_slot += 1;
+                let slot = r.slot_ptr(index);
+                unsafe {
+                    if (*slot).state == SLOT_USED && (*slot).pid != 0 {
+                        out.push(DeadCand {
+                            node: false,
+                            index,
+                            pid: (*slot).pid,
+                            generation: (*slot).generation,
+                        });
+                    }
+                }
+            } else {
+                return;
             }
         }
     }
-    let mut freed = 0;
-    // Only slots below the allocation cursor were ever handed out — until
-    // the cursor wraps (SCAN_WRAPPED), higher slots are sparse zero pages
-    // that must not be faulted in just to discover pid == 0.
-    let header = r.header();
-    let slot_hi = if header.next_scan & SCAN_WRAPPED != 0 {
-        SLOT_COUNT
-    } else {
-        header.next_scan
-    };
-    for index in 0..slot_hi {
-        let slot = r.slot_ptr(index);
-        unsafe {
-            if (*slot).state == SLOT_USED && (*slot).pid != 0 && !pid_alive((*slot).pid) {
-                (*slot).state = SLOT_FREE;
-                (*slot).generation = (*slot).generation.wrapping_add(1);
-                wake_object(r, index);
-                freed += 1;
+}
+
+/// Distinct pids one sweep remembers liveness for. A process that owns many
+/// objects and waiter nodes is the normal case in a Wine prefix, so caching
+/// verdicts keeps a sweep at one `kill(2)` per pid instead of one per
+/// candidate. Overflow just probes the pid again.
+const PID_CACHE: usize = 32;
+
+/// Stack-local pid liveness cache for one sweep: no allocation, no lock.
+struct PidCache {
+    pid: [u32; PID_CACHE],
+    alive: [bool; PID_CACHE],
+    next: usize,
+}
+
+impl PidCache {
+    fn new() -> Self {
+        Self {
+            pid: [0; PID_CACHE],
+            alive: [false; PID_CACHE],
+            next: 0,
+        }
+    }
+
+    fn alive(&mut self, pid: u32) -> bool {
+        if pid == 0 {
+            return false; // never an owner; same verdict as pid_alive(0)
+        }
+        for i in 0..PID_CACHE {
+            if self.pid[i] == pid {
+                return self.alive[i];
             }
         }
+        let alive = pid_alive(pid);
+        let i = self.next;
+        self.next = (i + 1) % PID_CACHE;
+        self.pid[i] = pid;
+        self.alive[i] = alive;
+        alive
+    }
+}
+
+/// Reap the candidates the caller has already probed: `alive[i]` is the
+/// liveness verdict for candidate `i`, computed (possibly outside the lock)
+/// by the caller. Each candidate is re-validated under the lock before it is
+/// mutated, so a node/slot reused while the lock was dropped is left alone
+/// (a reused slot has a new generation; a reused node a different registered
+/// pid). Runs NO syscall. Caller holds the region lock. Returns objects freed.
+fn reap_dead_locked(r: &Region, cands: &[DeadCand], alive: &[bool]) -> u32 {
+    let mut freed = 0;
+    for (c, &is_alive) in cands.iter().zip(alive.iter()) {
+        if is_alive {
+            continue;
+        }
+        if c.node {
+            let node = r.node_ptr(c.index);
+            unsafe {
+                if (*node).registered != 0 && (*node).pid == c.pid {
+                    node_detach(r, c.index);
+                    // Detaching only unlinks. A dead waiter never runs its own
+                    // cleanup, so nothing else can reach this node: return it
+                    // to the pool or the region loses one node per dead waiter
+                    // until the table is exhausted and waits start failing.
+                    node_free(r, c.index);
+                }
+            }
+        } else {
+            let slot = r.slot_ptr(c.index);
+            unsafe {
+                if (*slot).state == SLOT_USED
+                    && (*slot).pid == c.pid
+                    && (*slot).generation == c.generation
+                {
+                    (*slot).state = SLOT_FREE;
+                    (*slot).generation = (*slot).generation.wrapping_add(1);
+                    wake_object(r, c.index);
+                    freed += 1;
+                }
+            }
+        }
+    }
+    freed
+}
+
+/// Body of sweep_dead with the region lock already held. The liveness probe
+/// runs under the lock here: the caller asked for a sweep, so it may block.
+/// Returns the number of objects freed.
+fn sweep_dead_locked(r: &Region) -> u32 {
+    let mut scan = SweepScan::new(r);
+    let mut cands = Vec::new();
+    let mut verdicts: Vec<bool> = Vec::new();
+    let mut cache = PidCache::new();
+    let mut freed = 0;
+    loop {
+        scan.next_chunk(r, &mut cands);
+        if cands.is_empty() {
+            break;
+        }
+        verdicts.clear();
+        verdicts.extend(cands.iter().map(|c| cache.alive(c.pid)));
+        freed += reap_dead_locked(r, &cands, &verdicts);
     }
     freed
 }
@@ -1840,7 +1992,7 @@ fn spin_credit_penalize() {
 /// common case: a thread-local counter gates the (vDSO, ~20ns) clock
 /// read to every 256th call, and the region-wide interval check is then
 /// one relaxed atomic load. The region lock serializes concurrent
-/// sweepers; sweep_ns is re-checked under it.
+/// sweepers; the interval is claimed under it before any scanning.
 fn auto_sweep_dead(r: &Region) {
     // Thread-local counter: ~1ns per call, no cacheline sharing. Sweep
     // promptness is unaffected: under any real load 256 signal ops pass
@@ -1862,16 +2014,45 @@ fn auto_sweep_dead(r: &Region) {
     if now.saturating_sub(cell.load(Ordering::Relaxed)) < interval {
         return;
     }
-    if let Ok(_g) = r.lock_guard() {
-        let now = monotonic_ns();
-        if now.saturating_sub(cell.load(Ordering::Relaxed)) < interval {
-            return; // another process just swept
+    let Ok(g) = r.lock_guard() else { return };
+    let now = monotonic_ns();
+    if now.saturating_sub(cell.load(Ordering::Relaxed)) < interval {
+        return; // another process just swept
+    }
+    // Claim the interval before doing any work. Stamping on completion
+    // instead would leave a pass that finds nothing dead unrecorded, and
+    // every thread's 256-call gate could then start a fresh region-wide
+    // scan: the claim is what limits the sweep to one pass per interval.
+    cell.store(now, Ordering::Release);
+    let mut guard = Some(g);
+    let mut scan = SweepScan::new(r);
+    let mut cands = Vec::new();
+    let mut verdicts: Vec<bool> = Vec::new();
+    let mut cache = PidCache::new();
+    let mut freed = 0u32;
+    loop {
+        // A chunk of candidates is collected under the lock, but liveness is
+        // never probed here: `pid_alive` is a `kill(2)`, and holding the
+        // shared region mutex across a whole table of them wedges every
+        // other process's ntsync wait/signal for that entire span.
+        scan.next_chunk(r, &mut cands);
+        if cands.is_empty() {
+            break;
         }
-        let freed = sweep_dead_locked(r);
-        cell.store(now, Ordering::Release);
-        if freed > 0 && debug_enabled() {
-            debug_log(&format!("auto-sweep freed {freed} dead objects"));
+        drop(guard.take());
+        verdicts.clear();
+        verdicts.extend(cands.iter().map(|c| cache.alive(c.pid)));
+        guard = r.lock_guard().ok();
+        if guard.is_none() {
+            break;
         }
+        // Re-validated in reap_dead_locked: a node or slot reused while the
+        // lock was dropped is skipped instead of mutated.
+        freed += reap_dead_locked(r, &cands, &verdicts);
+    }
+    drop(guard);
+    if freed > 0 && debug_enabled() {
+        debug_log(&format!("auto-sweep freed {freed} dead objects"));
     }
 }
 
@@ -1887,10 +2068,150 @@ fn alloc_slot_or_sweep(r: &Region) -> Option<u32> {
     })
 }
 
+/// Free all objects created by processes that no longer exist, and purge
+/// waiter nodes left behind by dead waiters. Userspace has no fd-close-on-
+/// death hook, so callers (e.g. a launcher or wineserver replacement)
+/// should run this after a process exits.
 pub fn sweep_dead() -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     Ok(sweep_dead_locked(r))
+}
+
+/// Tests: drive one `SweepScan` pass and report (chunks, candidates), so the
+/// chunk iteration can be checked without forking dead owners.
+#[cfg(test)]
+pub(crate) fn test_scan_candidates() -> (usize, usize) {
+    let Ok(r) = region() else { return (0, 0) };
+    let Ok(_g) = r.lock_guard() else { return (0, 0) };
+    let mut scan = SweepScan::new(r);
+    let mut out = Vec::new();
+    let (mut chunks, mut cands) = (0, 0);
+    loop {
+        scan.next_chunk(r, &mut out);
+        if out.is_empty() {
+            break;
+        }
+        chunks += 1;
+        cands += out.len();
+    }
+    (chunks, cands)
+}
+
+/// Tests: slot index mask, so a test can tell whether two handles share a
+/// slot.
+#[cfg(test)]
+pub(crate) const SLOT_MASK: u32 = INDEX_MASK;
+
+/// Tests: build a dead-owner candidate for `handle`'s slot as (index, pid,
+/// generation), so a caller can reap it later against a slot that may have
+/// been reused. None if the handle is stale.
+#[cfg(test)]
+pub(crate) fn test_slot_candidate(handle: u32) -> Option<(u32, u32, u32)> {
+    let r = region().ok()?;
+    let _g = r.lock_guard().ok()?;
+    let slot = r.slot(handle)?;
+    unsafe { Some((handle & INDEX_MASK, (*slot).pid, handle >> INDEX_BITS)) }
+}
+
+/// Tests: reap a candidate from `test_slot_candidate` with the caller's
+/// liveness verdict. Returns objects freed (0 when the slot was reused).
+#[cfg(test)]
+pub(crate) fn test_reap_slot_candidate(cand: (u32, u32, u32), alive: bool) -> u32 {
+    let Ok(r) = region() else { return 0 };
+    let Ok(_g) = r.lock_guard() else { return 0 };
+    let c = DeadCand {
+        node: false,
+        index: cand.0,
+        pid: cand.1,
+        generation: cand.2,
+    };
+    reap_dead_locked(r, &[c], &[alive])
+}
+
+/// Tests: (index, pid) of the first node registered on `handle`'s waiter
+/// list, i.e. of the process currently blocked on it.
+#[cfg(test)]
+pub(crate) fn test_first_waiter(handle: u32) -> Option<(u32, u32)> {
+    let r = region().ok()?;
+    let _g = r.lock_guard().ok()?;
+    let slot = r.slot(handle)?;
+    let mut idx = unsafe { (*slot).waiter_head };
+    let mut guard = 0;
+    while idx != NIL && guard <= NODE_COUNT {
+        guard += 1;
+        let node = r.node_ptr(idx);
+        unsafe {
+            if (*node).registered != 0 {
+                return Some((idx, (*node).pid));
+            }
+            idx = (*node).obj_next;
+        }
+    }
+    None
+}
+
+/// Tests: reap a waiter-node candidate with the caller's verdict. Returns
+/// true if the node was detached (and so returned to the node pool).
+#[cfg(test)]
+pub(crate) fn test_reap_node_candidate(cand: (u32, u32), alive: bool) -> bool {
+    let Ok(r) = region() else { return false };
+    let Ok(_g) = r.lock_guard() else { return false };
+    let node = r.node_ptr(cand.0);
+    let before = unsafe { (*node).registered != 0 };
+    let c = DeadCand {
+        node: true,
+        index: cand.0,
+        pid: cand.1,
+        generation: 0,
+    };
+    reap_dead_locked(r, &[c], &[alive]);
+    before && unsafe { (*node).registered == 0 }
+}
+
+/// Tests: sweep with the region lock held and report what happened to node
+/// `idx` within that same locked section: (reaped, back in the pool, freed).
+/// A separate sweep-then-inspect pair would race with the other tests, which
+/// can allocate the freed node or reap the orphan themselves in between.
+#[cfg(test)]
+pub(crate) fn test_sweep_and_inspect_node(idx: u32) -> (bool, bool, u32) {
+    let Ok(r) = region() else {
+        return (false, false, 0);
+    };
+    let Ok(_g) = r.lock_guard() else {
+        return (false, false, 0);
+    };
+    let registered_before = unsafe { (*r.node_ptr(idx)).registered != 0 };
+    let freed = sweep_dead_locked(r);
+    let registered_after = unsafe { (*r.node_ptr(idx)).registered != 0 };
+    let mut pooled = false;
+    let mut cur = r.header().node_free_head;
+    let mut guard = 0;
+    while cur != NIL && guard <= NODE_COUNT {
+        guard += 1;
+        if cur == idx {
+            pooled = true;
+            break;
+        }
+        cur = unsafe { (*r.node_ptr(cur)).waiter_next };
+    }
+    (registered_before && !registered_after, pooled, freed)
+}
+
+/// Tests: liveness verdicts a fresh `PidCache` returns for `pids`.
+#[cfg(test)]
+pub(crate) fn test_pid_cache(pids: &[u32]) -> Vec<bool> {
+    let mut cache = PidCache::new();
+    pids.iter().map(|&pid| cache.alive(pid)).collect()
+}
+
+/// Tests: current auto-sweep clock, i.e. when the last pass claimed its
+/// interval (0 = never).
+#[cfg(test)]
+pub(crate) fn test_sweep_clock_ns() -> u64 {
+    let Ok(r) = region() else { return 0 };
+    let cell = unsafe { &*(&r.header().sweep_ns as *const u64 as *const AtomicU64) };
+    cell.load(Ordering::Acquire)
 }
 
 /// Tests: force the auto-sweep rate limiter to consider the interval

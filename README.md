@@ -256,7 +256,9 @@ the same region path see the same objects. After a process exits, call
 ## Test
 
 ```sh
-cargo test   # host-side unit tests, including a cross-process fork test
+cargo test   # host-side unit tests, including cross-process fork tests.
+             # Serialized: they fork while other test threads may hold the
+             # shared region lock, which deadlocks the child.
 
 # perf simulations (signaled-wait latency, signal churn, ping-pong wake
 # latency same-process and cross-process, contended mutex):

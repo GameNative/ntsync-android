@@ -1,3 +1,10 @@
+# Test threads must not run in parallel: several tests fork, and a fork that
+# lands while another thread holds the shared region mutex leaves the child
+# with a lock whose owner does not exist in it, so the child hangs on its first
+# ntsync call. The region-wide auto-sweep clock is shared state as well.
+[env]
+RUST_TEST_THREADS = "1"
+
 # 16 KB page-size alignment required by Google Play (Android 15+) for native libs.
 [target.aarch64-linux-android]
 rustflags = ["-C", "link-args=-Wl,-z,max-page-size=16384"]
