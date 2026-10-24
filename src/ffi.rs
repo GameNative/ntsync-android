@@ -207,6 +207,31 @@ pub extern "C" fn ntsync_close(handle: u32) -> i32 {
     }
 }
 
+/// Register the calling process as a holder of `handle`, so the sweep keeps
+/// the object alive after its creator exits while this process still uses it.
+/// Call it on a handle that arrived from another process (wineserver relays
+/// objects); idempotent per process.
+#[no_mangle]
+pub extern "C" fn ntsync_retain(handle: u32) -> i32 {
+    match core::retain(handle) {
+        Ok(()) => 0,
+        Err(core::Error::Invalid) => -EINVAL,
+        Err(core::Error::Init(e)) => -e,
+        Err(_) => -EINVAL,
+    }
+}
+
+/// Drop this process's holder entry without closing the object.
+#[no_mangle]
+pub extern "C" fn ntsync_release(handle: u32) -> i32 {
+    match core::release(handle) {
+        Ok(()) => 0,
+        Err(core::Error::Invalid) => -EINVAL,
+        Err(core::Error::Init(e)) => -e,
+        Err(_) => -EINVAL,
+    }
+}
+
 /// NTSYNC_IOC_SEM_RELEASE. On success `count` is overwritten with the
 /// previous count.
 #[no_mangle]

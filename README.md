@@ -53,6 +53,16 @@ mutex consistent.
   wake walks, signal→scheduled wake latency `wake_lat_cnt/us_sum/us_max`);
   emit a "stuck wait" dump with per-object state (including creator pid
   liveness) when a wait stalls.
+- Object lifetime: an object is reaped only when its creator **and every
+  holder** are dead. `ntsync_retain(handle)` registers the calling process as
+  a holder, `ntsync_release` drops it, and `close` does it implicitly. Call
+  `retain` when a handle arrives from another process — wineserver relays
+  objects, and a relayed handle would otherwise be reaped at the next sweep
+  once its creator exits. The kernel driver has no equivalent because a
+  duplicated fd keeps the object alive on its own. A slot tracks up to 8
+  holder pids; an object relayed wider than that is never reaped
+  automatically (a leak, rather than freeing something still in use). Layout
+  version 10: an older region file is rejected with `-ESTALE`.
 - `NTSYNC_SWEEP_INTERVAL_SEC` — auto-sweep cadence for dead-process
   cleanup, default 30. The kernel driver reaps a dead process's objects
   via fd release; userspace has no such hook, so the library runs the
@@ -78,6 +88,38 @@ mutex consistent.
   is a shared-cache-line load (tens of ns under contention).
   `spin_wins`/`spin_exhausted` in the NTSYNC_DEBUG stats show the
   hit rate.
+- `NTSYNC_SPIN_TAIL_US` — deadline spin tail, default `0` (off), capped
+  at 2000. When a wait has a timeout, the last N microseconds before the
+  deadline are spun instead of parked. A futex timeout cannot fire closer
+  than the process's timer slack (50 us under bionic), which is what a
+  frame-pacing wait is measured against, so this is the difference between
+  landing on the frame boundary and landing 60-100 us late. Measured on an
+  idle 8 Elite (Android 15, 1 ms frame budget): overshoot p50 106 us ->
+  1.1 us, p99 132 us -> 1.4 us. Opt in only for a thread that is pacing
+  frames; a 150-200 us tail is the useful range and it burns that much CPU
+  per frame while enabled.
+  On a loaded mid-tier device (Dimensity 8400, load average ~20, 1 ms
+  budget) the same knob gave p50 118 us -> 5 us but p99 670 us -> 490 us
+  only: a spin lands on time only if it gets the CPU, so this is a
+  quiet-device optimisation of the median, not a fix for loaded-device
+  jitter.
+  Its real cost, measured with `sim_wait_only_pacing` (one wait per frame,
+  nothing else in the loop — the older `sim_vsync_pacing` number was 3x too
+  high because that loop spins 150 us itself): 24 -> 80 us of CPU per frame
+  on a Snapdragon 8 Gen 2, 7.5 -> 99 us on x86, i.e. about 5 % of a core at
+  a 1 ms frame and a 150 us tail. Cheaper alternative for an app that
+  controls the process: `prctl(PR_SET_TIMERSLACK, 1)` — 106 us -> 20-56 us
+  p50 on the idle device, 118 us -> 64 us on the loaded one, no spin cost.
+- `NTSYNC_SPIN_TAIL_BUDGET_PCT` — how much of one core the spin tail may
+  spend, default 15, `0` = unlimited. A per-thread token bucket refilled at
+  that rate: a thread that spends faster than it refills is throttled within
+  a few frames and its waits park normally until it has allowance again. At
+  1 kHz a 150 us tail sits right at the 15 % default, so the knob is inert
+  there by design; it exists to stop a mistuning, which is one env edit away
+  — a tail longer than the frame means the wait never parks at all
+  (a 1500 us tail on a 1 ms frame pins a core: 998 us of CPU per frame,
+  measured), and the same mistuning at the default budget costs 176 us and
+  keeps the parked overshoot.
 
 ### When to enable spinning (per-game guide)
 

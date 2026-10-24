@@ -40,7 +40,7 @@ use std::time::Duration;
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 9;
+const VERSION: u32 = 10;
 const SLOT_COUNT: u32 = 16384;
 const NODE_COUNT: u32 = 8192;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
@@ -70,6 +70,12 @@ fn resolve_path(path: Option<&str>) -> Result<String, i32> {
 
 const SLOT_FREE: u32 = 0;
 const SLOT_USED: u32 = 1;
+
+/// Holder pids a slot tracks. An object relayed to more processes than this
+/// gets the overflow bit and is never reaped automatically, which is the safe
+/// direction: a leaked object costs memory, a wrongly freed one costs a game.
+const MAX_HOLDERS: usize = 8;
+const HOLDER_OVERFLOW: u32 = 0x8000_0000;
 
 const TYPE_SEM: u32 = 1;
 const TYPE_MUTEX: u32 = 2;
@@ -117,9 +123,15 @@ struct Slot {
     obj_type: u32,  // TYPE_*
     pid: u32,       // creator pid, for ntsync_sweep_dead
     waiter_head: u32, // head of the per-object waiter list (node index, NIL)
-    _pad: u32,
+    holders_len: u32, // pids in `holders`; HOLDER_OVERFLOW if it spilled
     w0: u64,        // packed object state (atomic)
     d: u64,         // event: pulse_seq (atomic)
+    /// Processes that hold this object besides its creator. wineserver relays
+    /// a handle to another process when it hands the object on, and userspace
+    /// has no fd-close hook on process death, so the only way to know a holder
+    /// is gone is to remember who it was. The sweep reaps an object only when
+    /// the creator AND every holder are dead.
+    holders: [u32; MAX_HOLDERS],
 }
 
 const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
@@ -783,6 +795,8 @@ unsafe fn slot_publish(r: &Region, handle: u32, obj_type: u32, w0: u64) {
     st64(&(*slot).d, 0);
     (*slot).obj_type = obj_type;
     (*slot).pid = libc::getpid() as u32;
+    (*slot).holders_len = 0;
+    (*slot).holders = [0; MAX_HOLDERS];
     (&*(&(*slot).state as *const u32 as *const AtomicU32)).store(SLOT_USED, Ordering::Release);
 }
 
@@ -816,6 +830,74 @@ pub fn create_event(manual: bool, signaled: bool) -> Result<u32, Error> {
     Ok(handle)
 }
 
+/// Remove `pid` from a slot's holder list, if present. Caller holds the lock.
+unsafe fn holder_remove(slot: *mut Slot, pid: u32) {
+    let len = (*slot).holders_len & !HOLDER_OVERFLOW;
+    let cap = (len as usize).min(MAX_HOLDERS);
+    for i in 0..cap {
+        if (*slot).holders[i] == pid {
+            let last = cap - 1;
+            (*slot).holders[i] = (*slot).holders[last];
+            (*slot).holders[last] = 0;
+            (*slot).holders_len =
+                ((cap - 1) as u32) | ((*slot).holders_len & HOLDER_OVERFLOW);
+            return;
+        }
+    }
+}
+
+/// Record that the calling process holds `handle`. Caller holds the lock.
+unsafe fn holder_add(slot: *mut Slot, pid: u32) {
+    let len = (*slot).holders_len & !HOLDER_OVERFLOW;
+    let cap = (len as usize).min(MAX_HOLDERS);
+    for i in 0..cap {
+        if (*slot).holders[i] == pid {
+            return; // already recorded
+        }
+    }
+    if cap == MAX_HOLDERS {
+        // Out of room: keep the object alive forever rather than risk freeing
+        // it while an untracked holder still uses it.
+        (*slot).holders_len |= HOLDER_OVERFLOW;
+        return;
+    }
+    (*slot).holders[cap] = pid;
+    (*slot).holders_len =
+        ((cap + 1) as u32) | ((*slot).holders_len & HOLDER_OVERFLOW);
+}
+
+/// Register the calling process as a holder of `handle`.
+///
+/// A handle can outlive the process that created it: wineserver relays objects
+/// to other processes, and userspace has no fd-close hook, so without this the
+/// sweep reaps a relayed object as soon as its creator exits. Call it when a
+/// handle arrives from elsewhere; `close` removes the entry again. Idempotent
+/// per process.
+pub fn retain(handle: u32) -> Result<(), Error> {
+    if handle & INDEX_MASK == 0 {
+        return Err(Error::Invalid);
+    }
+    let r = region()?;
+    let _g = r.lock_guard().map_err(Error::Init)?;
+    let slot = r.slot(handle).ok_or(Error::Invalid)?;
+    unsafe { holder_add(slot, libc::getpid() as u32) };
+    Ok(())
+}
+
+/// Drop the calling process's holder entry for `handle` without closing it.
+/// `close` does this itself; this exists for a process that stops using a
+/// relayed handle but does not own the object.
+pub fn release(handle: u32) -> Result<(), Error> {
+    if handle & INDEX_MASK == 0 {
+        return Err(Error::Invalid);
+    }
+    let r = region()?;
+    let _g = r.lock_guard().map_err(Error::Init)?;
+    let slot = r.slot(handle).ok_or(Error::Invalid)?;
+    unsafe { holder_remove(slot, libc::getpid() as u32) };
+    Ok(())
+}
+
 pub fn close(handle: u32) -> bool {
     if handle & INDEX_MASK == 0 {
         return false; // slot 0 is reserved (TYPE_RESERVED)
@@ -824,6 +906,11 @@ pub fn close(handle: u32) -> bool {
     let Ok(_g) = r.lock_guard() else { return false };
     let Some(slot) = r.slot(handle) else { return false };
     unsafe {
+        // This process no longer holds the object. wineserver normally closes
+        // only when the last handle is gone, so the slot is freed below as it
+        // always was; the holder entry only exists so a *crashed* holder is
+        // not mistaken for a dead creator.
+        holder_remove(slot, libc::getpid() as u32);
         // Free first (acquire/release pairs with slot_publish), then wake
         // waiters so they re-validate and fail with -EINVAL (kernel keeps
         // objects alive via fds, so it has no equivalent).
@@ -1656,6 +1743,35 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             remaining
         };
 
+        // Spin tail: a futex timeout cannot fire closer than the process's
+        // timer slack, so hand the last `tail` of the wait to a spin instead
+        // of parking it. Short waits spin immediately; longer ones park for
+        // the part before the tail, and the next iteration lands here to spin
+        // out the remainder.
+        // Inside the tail, spin only while the thread's allowance lasts; when
+        // it is spent the wait parks the whole remainder, so a thread pacing
+        // every frame cannot quietly burn a core.
+        let mut slice = slice;
+        if let (Some(tail), Some(left)) = (spin_tail(), slice) {
+            if left > tail {
+                // Only shorten the park when this thread will be allowed to
+                // spin the tail it is parked short of; otherwise the wait
+                // would cost two parks for a tail it never gets.
+                if tail_budget_can(tail.as_nanos() as u64) {
+                    slice = Some(left - tail);
+                }
+            } else if tail_budget_take(left.as_nanos() as u64) {
+                let word = unsafe { &(*r.node_ptr(head)).seq };
+                let dl = std::time::Instant::now() + left;
+                while std::time::Instant::now() < dl {
+                    if word.load(Ordering::Acquire) != seq {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+        }
         stat_bump(3); // futex_sleeps
         let ret = futex_wait(unsafe { &(*r.node_ptr(head)).seq }, seq, slice);
         if ret == 0 && debug {
@@ -1721,11 +1837,29 @@ fn pid_alive(pid: u32) -> bool {
 /// `kill(2)` syscall) runs OUTSIDE the region lock. `generation` is only
 /// meaningful for a slot (it detects the slot being freed and reallocated
 /// while unlocked).
-struct DeadCand {
+pub(crate) struct DeadCand {
     node: bool,
     index: u32,
     pid: u32,
     generation: u32,
+    /// Holder pids as they were when the candidate was collected (slots only).
+    /// The candidate is skipped if they changed before the reap, and the whole
+    /// object is kept alive if any of them is still alive.
+    holders: [u32; MAX_HOLDERS],
+    holders_len: u32,
+}
+
+impl DeadCand {
+    fn node(index: u32, pid: u32) -> Self {
+        Self {
+            node: true,
+            index,
+            pid,
+            generation: 0,
+            holders: [0; MAX_HOLDERS],
+            holders_len: 0,
+        }
+    }
 }
 
 /// Candidates per chunk: bounds both the memory a sweep holds while the
@@ -1779,12 +1913,7 @@ impl SweepScan {
                 let node = r.node_ptr(index);
                 unsafe {
                     if (*node).registered != 0 {
-                        out.push(DeadCand {
-                            node: true,
-                            index,
-                            pid: (*node).pid,
-                            generation: 0,
-                        });
+                        out.push(DeadCand::node(index, (*node).pid));
                     }
                 }
             } else if self.next_slot < self.slot_hi {
@@ -1798,6 +1927,8 @@ impl SweepScan {
                             index,
                             pid: (*slot).pid,
                             generation: (*slot).generation,
+                            holders: (*slot).holders,
+                            holders_len: (*slot).holders_len,
                         });
                     }
                 }
@@ -1848,6 +1979,22 @@ impl PidCache {
     }
 }
 
+/// Whether a candidate's owner is still alive, creator or any holder. A
+/// relayed object outlives its creator by design, so a dead creator alone is
+/// not enough to reap it.
+fn cand_alive(c: &DeadCand, cache: &mut PidCache) -> bool {
+    if cache.alive(c.pid) {
+        return true;
+    }
+    let len = (c.holders_len & !HOLDER_OVERFLOW) as usize;
+    for &holder in c.holders.iter().take(len.min(MAX_HOLDERS)) {
+        if holder != 0 && cache.alive(holder) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Reap the candidates the caller has already probed: `alive[i]` is the
 /// liveness verdict for candidate `i`, computed (possibly outside the lock)
 /// by the caller. Each candidate is re-validated under the lock before it is
@@ -1878,6 +2025,12 @@ fn reap_dead_locked(r: &Region, cands: &[DeadCand], alive: &[bool]) -> u32 {
                 if (*slot).state == SLOT_USED
                     && (*slot).pid == c.pid
                     && (*slot).generation == c.generation
+                    // A holder that registered while the lock was dropped must
+                    // not be freed out from under: re-check the snapshot.
+                    && (*slot).holders_len == c.holders_len
+                    && (*slot).holders == c.holders
+                    // Unknown holder set (the list spilled): keep it.
+                    && (*slot).holders_len & HOLDER_OVERFLOW == 0
                 {
                     (*slot).state = SLOT_FREE;
                     (*slot).generation = (*slot).generation.wrapping_add(1);
@@ -1905,7 +2058,7 @@ fn sweep_dead_locked(r: &Region) -> u32 {
             break;
         }
         verdicts.clear();
-        verdicts.extend(cands.iter().map(|c| cache.alive(c.pid)));
+        verdicts.extend(cands.iter().map(|c| cand_alive(c, &mut cache)));
         freed += reap_dead_locked(r, &cands, &verdicts);
     }
     freed
@@ -1940,6 +2093,103 @@ fn spin_max_iters() -> u32 {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0)
             .min(100_000)
+    })
+}
+
+/// Deadline spin tail. When a wait is within this many microseconds of its
+/// timeout, spin to the deadline instead of parking the thread: a futex
+/// timeout cannot fire closer than the process's timer slack (50 us under
+/// bionic, which is what a frame-pacing wait is measured against), so the
+/// last stretch is the difference between landing on the frame boundary and
+/// landing 60+ us late. NTSYNC_SPIN_TAIL_US sets it; default 0 (disabled)
+/// so nothing changes unless a caller opts in. Capped at 2000 us.
+fn spin_tail() -> Option<Duration> {
+    static TAIL: OnceLock<Option<Duration>> = OnceLock::new();
+    *TAIL.get_or_init(|| {
+        let us = std::env::var("NTSYNC_SPIN_TAIL_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(2000);
+        (us > 0).then(|| Duration::from_micros(us))
+    })
+}
+
+/// Per-thread spin budget for the tail. A pacing thread wakes every frame, so
+/// spinning 150 us of each 1 ms frame is 15% of a core: the allowance is
+/// enforced rather than trusted. Once a thread has spent it, its waits park
+/// normally until it refills. `NTSYNC_SPIN_TAIL_BUDGET_PCT` sets the
+/// percentage of one core the tail may use (default 15, 0 = unlimited). A
+/// 150 us tail on a 1 kHz frame costs 15% of a core, so that is the value
+/// that sustains the win; lower it to trade the median for CPU.
+fn spin_tail_budget_ns() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let pct = std::env::var("NTSYNC_SPIN_TAIL_BUDGET_PCT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15)
+            .min(100);
+        pct * 10_000_000 // that fraction of a second, in ns
+    })
+}
+
+/// Largest burst a thread may bank: its allowance for 10 ms of wall time.
+/// The bucket must not hold more than a few frames' worth, or a thread
+/// spending faster than it refills goes unthrottled for seconds and the
+/// rate limit never binds.
+#[cfg(test)]
+pub(crate) fn test_tail_budget_cap(budget: u64) -> u64 {
+    tail_budget_cap(budget)
+}
+
+fn tail_budget_cap(budget: u64) -> u64 {
+    (budget / 100).max(1)
+}
+
+thread_local! {
+    /// (tokens, last refill). Starts empty so the first use fills it.
+    static TAIL_BUDGET: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Charge `want_ns` of spin against this thread's allowance, refilling it by
+/// the time elapsed since the last charge. False means the allowance is spent
+/// and the caller must park instead of spinning.
+fn tail_budget_take(want_ns: u64) -> bool {
+    tail_budget(want_ns, true)
+}
+
+/// Whether the allowance covers `want_ns`, without charging it. Used to
+/// decide the park length before the tail it leads into is spun.
+fn tail_budget_can(want_ns: u64) -> bool {
+    tail_budget(want_ns, false)
+}
+
+fn tail_budget(want_ns: u64, charge: bool) -> bool {
+    let budget = spin_tail_budget_ns();
+    if budget == 0 {
+        return true; // unlimited
+    }
+    let cap = tail_budget_cap(budget);
+    let now = monotonic_ns();
+    TAIL_BUDGET.with(|c| {
+        let (mut tokens, mut last) = c.get();
+        if last == 0 {
+            tokens = cap;
+            last = now;
+        } else {
+            let elapsed = now.saturating_sub(last);
+            last = now;
+            tokens = tokens
+                .saturating_add(elapsed.saturating_mul(budget) / 1_000_000_000)
+                .min(cap);
+        }
+        let ok = tokens >= want_ns;
+        if ok && charge {
+            tokens -= want_ns;
+        }
+        c.set((tokens, last));
+        ok
     })
 }
 
@@ -2041,7 +2291,7 @@ fn auto_sweep_dead(r: &Region) {
         }
         drop(guard.take());
         verdicts.clear();
-        verdicts.extend(cands.iter().map(|c| cache.alive(c.pid)));
+        verdicts.extend(cands.iter().map(|c| cand_alive(c, &mut cache)));
         guard = r.lock_guard().ok();
         if guard.is_none() {
             break;
@@ -2114,6 +2364,21 @@ pub(crate) fn test_slot_candidate(handle: u32) -> Option<(u32, u32, u32)> {
     unsafe { Some((handle & INDEX_MASK, (*slot).pid, handle >> INDEX_BITS)) }
 }
 
+/// Tests: (holders_len, holder pids) for a handle, for asserting retain and
+/// release bookkeeping.
+#[cfg(test)]
+pub(crate) fn test_holders(handle: u32) -> Option<(u32, Vec<u32>)> {
+    let r = region().ok()?;
+    let _g = r.lock_guard().ok()?;
+    let slot = r.slot(handle)?;
+    unsafe {
+        let len = (*slot).holders_len;
+        let n = ((len & !HOLDER_OVERFLOW) as usize).min(MAX_HOLDERS);
+        let all = (*slot).holders;
+        Some((len, all[..n].to_vec()))
+    }
+}
+
 /// Tests: reap a candidate from `test_slot_candidate` with the caller's
 /// liveness verdict. Returns objects freed (0 when the slot was reused).
 #[cfg(test)]
@@ -2125,6 +2390,8 @@ pub(crate) fn test_reap_slot_candidate(cand: (u32, u32, u32), alive: bool) -> u3
         index: cand.0,
         pid: cand.1,
         generation: cand.2,
+        holders: [0; MAX_HOLDERS],
+        holders_len: 0,
     };
     reap_dead_locked(r, &[c], &[alive])
 }
@@ -2159,12 +2426,7 @@ pub(crate) fn test_reap_node_candidate(cand: (u32, u32), alive: bool) -> bool {
     let Ok(_g) = r.lock_guard() else { return false };
     let node = r.node_ptr(cand.0);
     let before = unsafe { (*node).registered != 0 };
-    let c = DeadCand {
-        node: true,
-        index: cand.0,
-        pid: cand.1,
-        generation: 0,
-    };
+    let c = DeadCand::node(cand.0, cand.1);
     reap_dead_locked(r, &[c], &[alive]);
     before && unsafe { (*node).registered == 0 }
 }
