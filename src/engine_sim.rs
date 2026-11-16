@@ -269,7 +269,9 @@ fn sim_ue45_frame_graph() {
 // ------------------------------------------------------------------ Unity ---
 
 /// Unity job system: per-job events, `Complete()` waits, and the contended
-/// graphics-device mutex.
+/// graphics-device mutex. Workers wait alertably, as every Wine wait does
+/// unless the caller asks otherwise, so the cost of a release with several
+/// workers parked shows up in "sem_release".
 #[test]
 #[ignore]
 fn sim_unity_job_system() {
@@ -286,13 +288,16 @@ fn sim_unity_job_system() {
     let next_job = Arc::new(AtomicU32::new(0));
 
     let mut workers = Vec::new();
+    let mut alerts = Vec::new();
     for _ in 0..WORKERS {
         let stop = stop.clone();
         let events = job_events.clone();
         let next_job = next_job.clone();
+        let alert = create_event(true, false).unwrap();
+        alerts.push(alert);
         workers.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                match wait_any(&[job_sem], me(), Some(Duration::from_millis(50)), 0) {
+                match wait_any(&[job_sem], me(), Some(Duration::from_millis(50)), alert) {
                     WaitOutcome::Signaled { .. } => {}
                     WaitOutcome::Timeout => continue,
                     _ => break,
@@ -314,11 +319,14 @@ fn sim_unity_job_system() {
     let mut frames = Frames::new(FPS);
     let budget = Duration::from_secs_f64(1.0 / FPS as f64);
     let mut complete = Hist::with_capacity(8192);
+    let mut release = Hist::with_capacity(8192);
     for _ in 0..FRAMES {
         let start = Instant::now();
         next_job.store(0, Ordering::Relaxed);
         for _ in 0..JOBS {
+            let w = Instant::now();
             let _ = sem_release(job_sem, 1);
+            release.push(w.elapsed());
         }
         // JobHandle.Complete(): one wait per job, in dispatch order.
         for &event in job_events.iter() {
@@ -339,11 +347,12 @@ fn sim_unity_job_system() {
     let _ = sem_release(job_sem, WORKERS as u32);
     frames.report("Unity job system", FPS);
     complete.report("Complete() wait");
+    release.report("sem_release");
     for w in workers {
         w.join().unwrap();
     }
     assert_eq!(frames.total as usize, FRAMES);
-    for e in job_events {
+    for e in job_events.into_iter().chain(alerts) {
         let _ = close(e);
     }
     let _ = close(job_sem);

@@ -72,8 +72,8 @@ mod tests {
         assert!(close(h));
     }
 
-    // ---- Budgeted wakes: a signal op wakes only as many single-object
-    // waiters as it can satisfy, oldest first; everyone else as before. ----
+    // ---- Budgeted wakes: a signal op wakes only as many wait-any waiters
+    // as it can satisfy, oldest first; wait-all waiters as before. ----
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         let start = std::time::Instant::now();
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_object_and_alertable_waiters_are_always_woken() {
+    fn multi_object_and_alertable_waiters_are_woken_within_budget() {
         setup();
         let sem = create_semaphore(0, 10).unwrap();
         let other = create_event(true, false).unwrap();
@@ -238,11 +238,13 @@ mod tests {
         joins.extend(park_single_waiters(sem, 2, 9510, &order));
         assert_eq!(test_waiter_counts(sem), (2, 2));
 
-        // Release one unit: both non-single waiters are woken (one takes it,
-        // the other parks again) and both single ones stay parked.
+        // Release one unit: only the oldest waiter (the multi-object one) is
+        // woken and takes it; the other three stay parked.
         sem_release(sem, 1).unwrap();
-        wait_until("one acquire", || got.load(Ordering::SeqCst) + order.lock().unwrap().len() as u32 == 1);
+        wait_until("one acquire", || got.load(Ordering::SeqCst) == 1);
         thread::sleep(Duration::from_millis(50));
+        assert_eq!(test_waiter_counts(sem), (2, 1), "the other waiters must stay parked");
+        assert!(order.lock().unwrap().is_empty());
         sem_release(sem, 3).unwrap();
         for j in joins {
             j.join().unwrap();
@@ -251,6 +253,100 @@ mod tests {
         for h in [sem, other, alert] {
             assert!(close(h));
         }
+    }
+
+    /// A wait-all waiter may need more than this object, so it is woken
+    /// whatever the budget.
+    #[test]
+    fn wait_all_waiters_are_always_woken() {
+        setup();
+        let sem = create_semaphore(0, 10).unwrap();
+        let gate = create_event(true, true).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut joins = park_single_waiters(sem, 1, 9550, &order);
+        joins.push(thread::spawn(move || {
+            assert!(matches!(wait_all(&[sem, gate], 9551, None, 0), WaitOutcome::Signaled { .. }));
+        }));
+        wait_until("wait-all waiter", || test_waiter_counts(sem) == (1, 1));
+        // Two units for two waiters: the single one is the oldest and uses
+        // the whole budget of the first release if it is the only one woken.
+        sem_release(sem, 1).unwrap();
+        sem_release(sem, 1).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(read_sem(sem).unwrap().0, 0);
+        for h in [sem, gate] {
+            assert!(close(h));
+        }
+    }
+
+    /// A wait-any waiter woken for a semaphore unit that returns for another
+    /// reason (its alert fired, or an earlier object in its list was
+    /// signaled) must pass the wake on, or the unit sits in the semaphore
+    /// with the next waiter asleep. `alertable` picks the reason.
+    fn decoy_passes_its_wake_on(alertable: bool, owner_base: u32) {
+        setup();
+        let mut passed_on = 0;
+        for round in 0..200u32 {
+            let sem = create_semaphore(0, 10).unwrap();
+            let ev = create_event(true, false).unwrap();
+            let owner = owner_base + round * 2;
+            // The decoy parks first, so it is the oldest waiter and the one
+            // a release of one unit wakes.
+            let decoy = thread::spawn(move || {
+                let out = if alertable {
+                    wait_any(&[sem], owner, None, ev)
+                } else {
+                    wait_any(&[ev, sem], owner, None, 0)
+                };
+                let sem_index = if alertable { 0 } else { 1 };
+                assert!(matches!(out, WaitOutcome::Signaled { .. }), "decoy: {out:?}");
+                is_signaled(out, sem_index)
+            });
+            wait_until("decoy to park", || test_waiter_counts(sem).1 == 1);
+            let consumer = thread::spawn(move || {
+                assert!(is_signaled(wait_any(&[sem], owner + 1, None, 0), 0));
+            });
+            wait_until("consumer to park", || test_waiter_counts(sem).0 == 1);
+
+            // The release wakes only the decoy. The event lands before the
+            // decoy gets to run, so it returns on the event and leaves the
+            // unit behind.
+            sem_release(sem, 1).unwrap();
+            event_set(ev).unwrap();
+            if decoy.join().unwrap() {
+                // The decoy won the race and took the unit itself.
+                sem_release(sem, 1).unwrap();
+            } else {
+                passed_on += 1;
+            }
+            let start = std::time::Instant::now();
+            while !consumer.is_finished() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "round {round}: consumer left parked, sem count {:?}",
+                    read_sem(sem)
+                );
+                thread::sleep(Duration::from_micros(200));
+            }
+            consumer.join().unwrap();
+            assert_eq!(read_sem(sem).unwrap().0, 0);
+            for h in [sem, ev] {
+                assert!(close(h));
+            }
+        }
+        assert!(passed_on > 0, "no round had the decoy return on the event");
+    }
+
+    #[test]
+    fn alerted_waiter_passes_its_wake_on() {
+        decoy_passes_its_wake_on(true, 9800);
+    }
+
+    #[test]
+    fn waiter_satisfied_by_another_object_passes_its_wake_on() {
+        decoy_passes_its_wake_on(false, 10300);
     }
 
     /// No lost wakeups under contention. Exactly as many units are released
@@ -268,17 +364,27 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let taken = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut consumers = Vec::new();
-        // 5 single-object consumers, 1 multi-object, 1 alertable.
+        // 4 single-object consumers, 2 multi-object, 2 alertable (one is both).
         for i in 0..7u32 {
             let taken = taken.clone();
             consumers.push(thread::spawn(move || {
                 for _ in 0..PER {
-                    let out = match i {
-                        5 => wait_any(&[sem, other], 9600 + i, None, 0),
-                        6 => wait_any(&[sem], 9600 + i, None, alert),
-                        _ => wait_any(&[sem], 9600 + i, None, 0),
-                    };
-                    assert!(is_signaled(out, 0), "consumer {i}: {out:?}");
+                    // Consumer 4 returns on `other` and consumers 5 and 6 on
+                    // their alert whenever the toggler fires them; they
+                    // then wait again, having passed their wake on.
+                    loop {
+                        let (out, sem_index) = match i {
+                            4 => (wait_any(&[other, sem], 9600 + i, None, 0), 1),
+                            5 => (wait_any(&[sem, other], 9600 + i, None, alert), 0),
+                            6 => (wait_any(&[sem], 9600 + i, None, alert), 0),
+                            _ => (wait_any(&[sem], 9600 + i, None, 0), 0),
+                        };
+                        assert!(matches!(out, WaitOutcome::Signaled { .. }), "consumer {i}: {out:?}");
+                        if is_signaled(out, sem_index) {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
                     taken.fetch_add(1, Ordering::Relaxed);
                 }
             }));
@@ -293,6 +399,17 @@ mod tests {
                         sem_release(sem, 1).unwrap();
                     }
                     std::thread::yield_now();
+                }
+            }));
+        }
+        for (t, ev) in [other, alert].into_iter().enumerate() {
+            let stop = stop.clone();
+            thieves.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    event_set(ev).unwrap();
+                    std::hint::spin_loop();
+                    event_reset(ev).unwrap();
+                    thread::sleep(Duration::from_micros(50 + 70 * t as u64));
                 }
             }));
         }

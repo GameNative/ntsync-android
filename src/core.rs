@@ -559,17 +559,24 @@ const REG_MULTI: u32 = 1;
 /// always attempts to acquire it, so a signal op may wake only as many of
 /// them as it can satisfy (see wake_object).
 const REG_SINGLE: u32 = 2;
+/// An object node of a wait-any waiter that has other nodes too (several
+/// objects, or an alert event). It is woken within the budget like a
+/// REG_SINGLE one, but such a waiter can return without taking the object it
+/// was woken for (the alert fired, or an earlier object in its list was
+/// signaled). It then passes the wake on to the next waiter: see the `owed`
+/// mask in wait().
+const REG_ANY: u32 = 3;
 
 /// Wake budget meaning "every waiter".
 const WAKE_ALL: u32 = u32::MAX;
 
 /// Register `node` on object `obj_idx`'s waiter list. Caller holds the lock.
-fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32, single: bool) {
+fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32, reg: u32) {
     let node = r.node_ptr(idx);
     let slot = r.slot_ptr(obj_idx);
     unsafe {
         let old_head = (*slot).waiter_head;
-        (*node).registered = if single { REG_SINGLE } else { REG_MULTI };
+        (*node).registered = reg;
         (*node).obj = obj_idx;
         (*node).wait_word = wait_word;
         (*node).obj_prev = NIL;
@@ -583,24 +590,26 @@ fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32, single: boo
 
 /// Wake the waiters registered on an object. Caller holds the lock.
 ///
-/// `budget` caps how many single-object waiters (REG_SINGLE) are woken:
+/// `budget` caps how many wait-any waiters (REG_SINGLE, REG_ANY) are woken:
 /// the units a signal op made available (semaphore release count, 1 for an
 /// auto-reset event or a freed mutex). Waking more of them only makes the
 /// extras run, fail to acquire, take the region lock twice and park again,
 /// all while the signaler pays one futex syscall per waiter - Unity's job
 /// system, which releases a semaphore to N parked workers many times per
-/// frame, spent about a quarter of its main thread there. A woken
-/// single-object waiter always retries the acquire (wait() re-registers and
-/// calls try_satisfy under the lock before any timeout or exit), so each
-/// unit of budget lands on a thread that will either take the object or
-/// find it already taken. The budget is charged only when futex_wake reports
-/// a thread actually woken: a waiter that is spinning, about to park, or
-/// dead costs no budget, and the next one is woken too.
+/// frame, spent about a fifth of its main thread there. Wine waits
+/// alertably by default, so those workers are REG_ANY, not REG_SINGLE.
 ///
-/// Every other waiter (several objects, wait-all, alertable) is always
-/// woken, as before: it may be woken and then not take this object, and
-/// waking only it could leave the object signaled with others asleep.
-/// WAKE_ALL wakes everyone (close, pulse, manual-reset events, reaping).
+/// A woken wait-any waiter retries the acquire (wait() re-registers and
+/// calls try_satisfy under the lock before any timeout), so each unit of
+/// budget lands on a thread that takes the object, finds it already taken,
+/// or - REG_ANY only - returns for another reason and wakes the next waiter
+/// in its place. The budget is charged only when futex_wake reports a
+/// thread actually woken: a waiter that is spinning, about to park, or dead
+/// costs no budget, and the next one is woken too.
+///
+/// Wait-all waiters and alert-event nodes (REG_MULTI) are always woken, as
+/// before. WAKE_ALL wakes everyone (close, pulse, manual-reset events,
+/// reaping).
 ///
 /// Waiters are woken oldest first (node_register pushes at the head), so a
 /// contended mutex or semaphore cannot starve an early waiter.
@@ -620,9 +629,9 @@ fn wake_object(r: &Region, obj_idx: u32, budget: u32) {
     }
     while idx != NIL {
         let node = r.node_ptr(idx);
-        let (prev, word, single) =
-            unsafe { ((*node).obj_prev, (*node).wait_word, (*node).registered == REG_SINGLE) };
-        if single && left == 0 {
+        let (prev, word, reg) = unsafe { ((*node).obj_prev, (*node).wait_word, (*node).registered) };
+        let budgeted = reg == REG_SINGLE || reg == REG_ANY;
+        if budgeted && left == 0 {
             stat_bump(16); // wakes_deferred
             idx = prev;
             continue;
@@ -637,10 +646,28 @@ fn wake_object(r: &Region, obj_idx: u32, budget: u32) {
             futex_wake(&(*head).seq)
         };
         stat_add(15, woken as u64); // threads_woken
-        if single && woken > 0 && left != WAKE_ALL {
+        if budgeted && woken > 0 && left != WAKE_ALL {
             left -= 1;
         }
         idx = prev;
+    }
+}
+
+/// Pass on the wakes a wait-any waiter was given for objects it is leaving
+/// without having taken: bit i of `owed` is handles[i]. Each was one unit of
+/// some signal op's budget, so one more waiter is woken per object. If the
+/// unit is gone by now the woken waiter just parks again. Caller holds the
+/// lock.
+fn forward_wakes(r: &Region, handles: &[u32], owed: u64, taken: Option<u32>) {
+    let mut bits = owed;
+    while bits != 0 {
+        let i = bits.trailing_zeros();
+        bits &= bits - 1;
+        if taken == Some(i) {
+            continue;
+        }
+        stat_bump(17); // wakes_forwarded
+        wake_object(r, handles[i as usize] & INDEX_MASK, 1);
     }
 }
 
@@ -1302,7 +1329,7 @@ fn debug_log(msg: &str) {
 mod stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub const NAMES: [&str; 17] = [
+    pub const NAMES: [&str; 18] = [
         "wait_calls",        // total wait_any/wait_all calls
         "wait_fast_ok",      // satisfied without any lock
         "wait_blocked",      // actually slept on a futex
@@ -1319,14 +1346,15 @@ mod stats {
         "spin_wins",         // waits satisfied during the pre-sleep spin
         "spin_exhausted",    // spins that still ended in a futex sleep
         "threads_woken",     // waiters a wake walk actually woke (futex_wake > 0)
-        "wakes_deferred",    // single-object waiters left parked: budget spent
+        "wakes_deferred",    // wait-any waiters left parked: budget spent
+        "wakes_forwarded",   // wakes passed on by a waiter that left without the object
     ];
-    pub static COUNTERS: [AtomicU64; 17] = [
+    pub static COUNTERS: [AtomicU64; 18] = [
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0),
     ];
 
     #[inline]
@@ -1563,6 +1591,10 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
     let mut entry_seqs = [0u64; MAX_WAIT_COUNT];
     let n_nodes = handles.len() + (alert != 0) as usize;
     let mut nodes = NodeSet::new();
+    // Object nodes this thread detached itself after its last park (timeout,
+    // EINTR, or a wake that came through another node). Every other node
+    // found detached at the top of the loop was detached by a signaler.
+    let mut self_detached = 0u64;
 
     // ---- Fast path: validate and try to acquire without any lock. ----
     let fast_valid = handles.iter().enumerate().all(|(i, h)| {
@@ -1609,6 +1641,21 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             return WaitOutcome::Invalid;
         };
 
+        // Objects whose signaler woke this wait-any waiter since it last
+        // parked (see REG_ANY). Leaving without taking one of them passes
+        // its wake on; a failed acquire below clears the debt, because the
+        // unit is then gone and this thread parks on the object again.
+        let mut owed = 0u64;
+        if !all && n_nodes > 1 && !nodes.is_empty() {
+            for i in 0..handles.len() {
+                if unsafe { (*r.node_ptr(nodes[i])).registered } == 0 {
+                    owed |= 1 << i;
+                }
+            }
+            owed &= !self_detached;
+        }
+        self_detached = 0;
+
         // Authoritative validation (also catches objects closed mid-wait).
         let mut valid = true;
         for (i, h) in handles.iter().enumerate() {
@@ -1634,6 +1681,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         }
         if !valid {
             waiter_cleanup(r, &mut nodes);
+            forward_wakes(r, handles, owed, None);
             return WaitOutcome::Invalid;
         }
 
@@ -1644,6 +1692,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             let slot = r.slot(alert).expect("validated above");
             if ld64(unsafe { &(*slot).w0 }) as u32 != 0 {
                 waiter_cleanup(r, &mut nodes);
+                forward_wakes(r, handles, owed, None);
                 return WaitOutcome::Signaled {
                     index: handles.len() as u32,
                     owner_dead: false,
@@ -1671,17 +1720,22 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             }
         }
         let head = nodes[0];
-        // One node in all (one object, no alert event): see REG_SINGLE.
-        let single = n_nodes == 1;
+        let reg = if all {
+            REG_MULTI
+        } else if n_nodes == 1 {
+            REG_SINGLE
+        } else {
+            REG_ANY
+        };
         for (i, h) in handles.iter().enumerate() {
             if unsafe { (*r.node_ptr(nodes[i])).registered } == 0 {
-                node_register(r, nodes[i], h & INDEX_MASK, head, single);
+                node_register(r, nodes[i], h & INDEX_MASK, head, reg);
             }
         }
         if alert != 0 {
             let an = nodes[handles.len()];
             if unsafe { (*r.node_ptr(an)).registered } == 0 {
-                node_register(r, an, alert & INDEX_MASK, head, false);
+                node_register(r, an, alert & INDEX_MASK, head, REG_MULTI);
             }
         }
 
@@ -1697,6 +1751,9 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         // Authoritative acquire attempt.
         if let Some(outcome) = try_satisfy(r, handles, owner, &entry_seqs, all) {
             waiter_cleanup(r, &mut nodes);
+            if let WaitOutcome::Signaled { index, .. } = outcome {
+                forward_wakes(r, handles, owed, Some(index));
+            }
             return outcome;
         }
 
@@ -1880,7 +1937,10 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             .any(|&idx| unsafe { ld32(&(*r.node_ptr(idx)).registered) } != 0);
         if any_registered {
             if let Ok(_g) = r.lock_guard() {
-                for &idx in nodes.iter() {
+                for (i, &idx) in nodes.iter().enumerate() {
+                    if i < handles.len() && unsafe { (*r.node_ptr(idx)).registered } != 0 {
+                        self_detached |= 1 << i;
+                    }
                     node_detach(r, idx);
                 }
             }
@@ -2468,6 +2528,7 @@ pub(crate) fn test_reap_slot_candidate(cand: (u32, u32, u32), alive: bool) -> u3
 }
 
 /// Tests: (single-object, other) waiter nodes registered on `handle`.
+/// "Other" counts REG_ANY and REG_MULTI nodes alike.
 #[cfg(test)]
 pub(crate) fn test_waiter_counts(handle: u32) -> (u32, u32) {
     let Ok(r) = region() else { return (0, 0) };
