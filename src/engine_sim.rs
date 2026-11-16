@@ -752,3 +752,311 @@ fn sim_primitive_costs() {
     let _ = close(sem);
     let _ = close(m);
 }
+
+// ------------------------------------------------- Unity release cost ---
+
+/// Thread CPU time (CLOCK_THREAD_CPUTIME_ID) in ns.
+fn thread_cpu_ns() -> u64 {
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// (user+sys ns, voluntary switches, involuntary switches) of the calling thread.
+fn thread_rusage() -> (u64, u64, u64) {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(1 /* RUSAGE_THREAD */, &mut ru) };
+    let ns = |t: libc::timeval| t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1000;
+    (ns(ru.ru_utime) + ns(ru.ru_stime), ru.ru_nvcsw as u64, ru.ru_nivcsw as u64)
+}
+
+fn pin_to(cpu: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+thread_local! {
+    static SIM_FLAG: std::sync::atomic::AtomicI32 = const { std::sync::atomic::AtomicI32::new(0) };
+}
+
+unsafe extern "C" fn sim_lock_flag() -> *mut i32 {
+    SIM_FLAG.with(|f| f.as_ptr())
+}
+
+fn walks_now() -> u64 {
+    test_counter(8)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn spin_us(us: u64) {
+    if us == 0 {
+        return;
+    }
+    let t = Instant::now();
+    let d = Duration::from_micros(us);
+    while t.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+/// The Forest's Unity job system as measured in game on the Odin 3: seven
+/// workers wait alertably (wait-any with an alert event, as Wine does) on one
+/// job semaphore; the main thread releases it one unit at a time, about 300
+/// times per 60 fps frame, in bursts with its own work in between, and waits
+/// for each job's completion event (JobHandle.Complete). Each acquired unit is
+/// one job of a few microseconds.
+///
+/// The judge for the release path is the main thread's CPU per release and
+/// its syscalls per release (run under `simpleperf stat --per-thread -e
+/// raw_syscalls:sys_enter`; the thread is named `sim-main`), with worker CPU
+/// and switches alongside. Knobs (env): SIM_WORKERS 7, SIM_FPS 60,
+/// SIM_RELEASES 300 per frame, SIM_BURST 10 releases per burst, SIM_GAP_US
+/// main work between two releases of a burst, SIM_MAIN_US main work after a
+/// burst before its completion waits, SIM_JOB_US worker work per job,
+/// SIM_SECS run length, SIM_PIN 1 = main on the last core, workers on the
+/// others.
+#[test]
+#[ignore]
+fn sim_unity_release_cost() {
+    setup();
+    let workers_n = env_u64("SIM_WORKERS", 7) as usize;
+    let fps = env_u64("SIM_FPS", 60);
+    let per_frame = env_u64("SIM_RELEASES", 300) as usize;
+    let burst = env_u64("SIM_BURST", 10).max(1) as usize;
+    let gap_us = env_u64("SIM_GAP_US", 5);
+    let main_us = env_u64("SIM_MAIN_US", 150);
+    let job_us = env_u64("SIM_JOB_US", 60);
+    let secs = env_u64("SIM_SECS", 8);
+    let pin = env_u64("SIM_PIN", 1) == 1;
+    let ncpu = thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+
+    // SIM_FLAG_HOOK=1: install a host lock-flag callback, as Wine does, so
+    // lock acquisitions use the flag instead of masking SIGUSR1.
+    if env_u64("SIM_FLAG_HOOK", 0) == 1 {
+        set_lock_flag_hook(Some(sim_lock_flag));
+    }
+    let job_sem = create_semaphore(0, 1 << 20).unwrap();
+    let done: Arc<Vec<u32>> = Arc::new((0..burst).map(|_| create_event(false, false).unwrap()).collect());
+    let next_job = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut workers = Vec::new();
+    let mut alerts = Vec::new();
+    // Threads report over channels and then stay parked until the process
+    // exits, so simpleperf's per-thread counters are still open at the end.
+    let (wtx, wrx) = std::sync::mpsc::channel();
+    for w in 0..workers_n {
+        let (stop, done, next_job, wtx) = (stop.clone(), done.clone(), next_job.clone(), wtx.clone());
+        let alert = create_event(true, false).unwrap();
+        alerts.push(alert);
+        workers.push(
+            thread::Builder::new()
+                .name(format!("sim-w{w}"))
+                .spawn(move || {
+                    if pin {
+                        pin_to(w % (ncpu - 1));
+                    }
+                    let r0 = thread_rusage();
+                    let mut jobs = 0u64;
+                    loop {
+                        match wait_any(&[job_sem], me(), Some(Duration::from_millis(100)), alert) {
+                            WaitOutcome::Signaled { index: 0, .. } => {}
+                            WaitOutcome::Timeout => {
+                                if stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            _ => break,
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let j = next_job.fetch_add(1, Ordering::Relaxed) as usize;
+                        spin_us(job_us);
+                        let _ = event_set(done[j % done.len()]);
+                        jobs += 1;
+                    }
+                    let r1 = thread_rusage();
+                    let _ = wtx.send((jobs, r1.0 - r0.0, r1.1 - r0.1, r1.2 - r0.2));
+                    loop {
+                        thread::park();
+                    }
+                })
+                .unwrap(),
+        );
+    }
+    // SIM_HOT=1: one SCHED_IDLE spinner per worker core keeps those cores out
+    // of deep idle, as the game's other threads do, so a woken worker runs
+    // within a few microseconds (it preempts the spinner) instead of after an
+    // idle-exit.
+    let hot = env_u64("SIM_HOT", 0) == 1;
+    if hot {
+        for c in 0..ncpu - 1 {
+            let stop = stop.clone();
+            thread::Builder::new()
+                .name(format!("sim-bg{c}"))
+                .spawn(move || {
+                    pin_to(c);
+                    let p = libc::sched_param { sched_priority: 0 };
+                    unsafe { libc::sched_setscheduler(0, 5 /* SCHED_IDLE */, &p) };
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+                .unwrap();
+        }
+    }
+    thread::sleep(Duration::from_millis(200)); // let every worker park
+
+    let c0 = test_counters();
+    let p0 = cpu_time();
+    let (mtx, mrx) = std::sync::mpsc::channel();
+    let main = {
+        let done = done.clone();
+        thread::Builder::new()
+            .name("sim-main".into())
+            .spawn(move || {
+                if pin {
+                    pin_to(ncpu - 1);
+                }
+                let r0 = thread_rusage();
+                let frame = Duration::from_secs_f64(1.0 / fps as f64);
+                let end = Instant::now() + Duration::from_secs(secs);
+                let (mut releases, mut rel_cpu, mut rel_wall, mut frames) = (0u64, 0u64, 0u64, 0u64);
+                // Releases that took a wake walk vs not, and their wall time
+                // (walks are counted process-wide, but during a release
+                // section only this thread signals).
+                let (mut walked, mut walked_ns) = (0u64, 0u64);
+                while Instant::now() < end {
+                    let fstart = Instant::now();
+                    let mut left = per_frame;
+                    while left > 0 {
+                        let n = left.min(burst);
+                        left -= n;
+                        // Release section: priced by thread CPU, minus the
+                        // main thread's own spin work in between.
+                        let c = thread_cpu_ns();
+                        let mut spun = Duration::ZERO;
+                        let mut inside = Duration::ZERO;
+                        for _ in 0..n {
+                            let s = Instant::now();
+                            spin_us(gap_us);
+                            let w0 = walks_now();
+                            let t = Instant::now();
+                            spun += t - s;
+                            let _ = sem_release(job_sem, 1);
+                            let el = t.elapsed();
+                            inside += el;
+                            if walks_now() != w0 {
+                                walked += 1;
+                                walked_ns += el.as_nanos() as u64;
+                            }
+                        }
+                        rel_cpu += (thread_cpu_ns() - c).saturating_sub(spun.as_nanos() as u64);
+                        rel_wall += inside.as_nanos() as u64;
+                        releases += n as u64;
+                        spin_us(main_us);
+                        for &e in done.iter().take(n) {
+                            let _ = wait_any(&[e], me(), Some(Duration::from_secs(2)), 0);
+                        }
+                    }
+                    frames += 1;
+                    if let Some(rest) = frame.checked_sub(fstart.elapsed()) {
+                        thread::sleep(rest);
+                    }
+                }
+                let r1 = thread_rusage();
+                println!(
+                    "UNITYSIM main: walked_releases={walked} ({:.3}/release) walk_wall_ns={:.0} nowalk_wall_ns={:.0}",
+                    walked as f64 / releases as f64,
+                    walked_ns as f64 / walked.max(1) as f64,
+                    (rel_wall - walked_ns) as f64 / (releases - walked).max(1) as f64
+                );
+                let _ = mtx.send((releases, rel_cpu, rel_wall, frames, r1.0 - r0.0, r1.1 - r0.1, r1.2 - r0.2));
+                loop {
+                    thread::park();
+                }
+            })
+            .unwrap()
+    };
+    let (releases, rel_cpu, rel_wall, frames, main_cpu, main_vcs, main_ivcs) = mrx.recv().unwrap();
+    let _ = main;
+    let c1 = test_counters();
+    let p1 = cpu_time();
+    stop.store(true, Ordering::Relaxed);
+    let _ = sem_release(job_sem, workers_n as u32);
+    let mut w_jobs = 0;
+    let mut w_cpu = 0;
+    let mut w_vcs = 0;
+    let mut w_ivcs = 0;
+    drop(wtx);
+    let _ = workers;
+    for _ in 0..workers_n {
+        let (j, c, v, i) = wrx.recv().unwrap();
+        w_jobs += j;
+        w_cpu += c;
+        w_vcs += v;
+        w_ivcs += i;
+    }
+    let d = |name: &str| {
+        let a = c0.iter().find(|(n, _)| *n == name).unwrap().1;
+        let b = c1.iter().find(|(n, _)| *n == name).unwrap().1;
+        (b - a) as f64
+    };
+    let wall = secs as f64;
+    let ld = |name: &str| -> f64 {
+        let i = c0.iter().position(|(n, _)| *n == name).unwrap();
+        (c1[i].1 - c0[i].1) as f64
+    };
+    if ld("wake_lat_cnt") > 0.0 {
+        println!("UNITYSIM wake_lat_avg_us={:.1}", ld("wake_lat_us_sum") / ld("wake_lat_cnt"));
+    }
+    println!(
+        "UNITYSIM flag_hook={} hot={hot} workers={workers_n} fps={fps} per_frame={per_frame} burst={burst} gap_us={gap_us} main_us={main_us} job_us={job_us} secs={secs} wake_all={} no_sigmask={} debug={}",
+        std::env::var("SIM_FLAG_HOOK").unwrap_or_default(),
+        std::env::var("NTSYNC_WAKE_ALL").unwrap_or_default(),
+        std::env::var("NTSYNC_NO_SIGUSR1_BLOCK").unwrap_or_default(),
+        std::env::var("NTSYNC_DEBUG").unwrap_or_default(),
+    );
+    println!(
+        "UNITYSIM frames={frames} fps_got={:.1} releases={releases} rel_cpu_ns={:.0} rel_wall_ns={:.0} main_cpu_pct={:.1} main_vcs_s={:.0} main_ivcs_s={:.0} workers_cpu_pct={:.1} worker_vcs_s={:.0} worker_ivcs_s={:.0} proc_cpu_pct={:.1} jobs={w_jobs}",
+        frames as f64 / wall,
+        rel_cpu as f64 / releases as f64,
+        rel_wall as f64 / releases as f64,
+        main_cpu as f64 / wall / 1e7,
+        main_vcs as f64 / wall,
+        main_ivcs as f64 / wall,
+        w_cpu as f64 / wall / 1e7,
+        w_vcs as f64 / wall / workers_n as f64,
+        w_ivcs as f64 / wall / workers_n as f64,
+        (p1 - p0).as_secs_f64() / wall * 100.0,
+    );
+    let ops = d("signal_ops");
+    println!(
+        "UNITYSIM walks_per_op={:.3} woken_per_walk={:.3} woken_per_op={:.3} blocked_per_wait={:.3} lock_acq_per_rel={:.3} contended_per_rel={:.3} walks_s={:.0} lock_acq_s={:.0} contended_s={:.0} deferred_s={:.0} forwarded={:.0} zero_wakes_s={:.0} rewalks_s={:.0}",
+        d("wake_walks") / ops,
+        d("threads_woken") / d("wake_walks"),
+        d("threads_woken") / ops,
+        d("wait_blocked") / d("wait_calls"),
+        d("lock_acq") / releases as f64,
+        d("lock_contended") / releases as f64,
+        d("wake_walks") / wall,
+        d("lock_acq") / wall,
+        d("lock_contended") / wall,
+        d("wakes_deferred") / wall,
+        d("wakes_forwarded"),
+        c1.iter().find(|(n, _)| *n == "wakes_unparked").map_or(0.0, |_| d("wakes_unparked")) / wall,
+        c1.iter().find(|(n, _)| *n == "wake_rewalks").map_or(0.0, |_| d("wake_rewalks")) / wall,
+    );
+    for e in done.iter().copied().chain(alerts) {
+        let _ = close(e);
+    }
+    let _ = close(job_sem);
+}

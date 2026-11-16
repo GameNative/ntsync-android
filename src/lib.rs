@@ -349,6 +349,171 @@ mod tests {
         decoy_passes_its_wake_on(false, 10300);
     }
 
+    /// A budgeted wake is charged when its node is detached and issued after
+    /// the unlock. If the oldest waiter belongs to a process that died, the
+    /// wake finds nobody parked, and the unit must go to the next waiter
+    /// instead of staying in the semaphore with that waiter asleep.
+    #[test]
+    fn dead_waiter_does_not_strand_a_unit() {
+        setup();
+        let sem = create_semaphore(0, 10).unwrap();
+        // Keep the auto-sweep from purging the dead node before the release.
+        test_touch_sweep_clock();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let _ = wait_any(&[sem], 11001, None, 0);
+            unsafe { libc::_exit(0) };
+        }
+        wait_until("child waiter to park", || test_waiter_counts(sem).0 == 1);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        let live = thread::spawn(move || {
+            assert!(is_signaled(wait_any(&[sem], 11002, Some(Duration::from_secs(10)), 0), 0));
+        });
+        wait_until("live waiter to park", || test_waiter_counts(sem).0 == 2);
+        sem_release(sem, 1).unwrap();
+        let start = std::time::Instant::now();
+        while !live.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(5), "unit stranded behind a dead waiter");
+            thread::sleep(Duration::from_millis(1));
+        }
+        live.join().unwrap();
+        assert_eq!(read_sem(sem).unwrap().0, 0);
+        assert!(close(sem));
+    }
+
+    /// Host cooperation for SIGUSR1 (ntsync_set_lock_flag_hook), modelled on
+    /// Wine: the handler "suspends" the thread (blocks until resumed) unless
+    /// the thread's lock flag is set, in which case it marks the signal
+    /// pending and returns; the library re-raises it after the unlock.
+    mod usr1 {
+        use super::super::core::*;
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+
+        pub static TARGET: AtomicU32 = AtomicU32::new(0);
+        pub static FLAG: AtomicI32 = AtomicI32::new(0);
+        pub static SUSPENDS: AtomicU32 = AtomicU32::new(0);
+        pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
+        pub static RESUME: AtomicBool = AtomicBool::new(false);
+        /// Negative control: the handler suspends regardless of the flag.
+        pub static IGNORE_FLAG: AtomicBool = AtomicBool::new(false);
+
+        pub unsafe extern "C" fn lock_flag() -> *mut i32 {
+            if unsafe { libc::gettid() } as u32 == TARGET.load(Ordering::SeqCst) {
+                FLAG.as_ptr()
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+
+        pub extern "C" fn handler(_: i32) {
+            if !IGNORE_FLAG.load(Ordering::SeqCst) && FLAG.load(Ordering::SeqCst) != 0 {
+                FLAG.fetch_or(LOCK_FLAG_SIGNAL_PENDING, Ordering::SeqCst);
+                return;
+            }
+            SUSPENDS.fetch_add(1, Ordering::SeqCst);
+            SUSPENDED.store(true, Ordering::SeqCst);
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000 };
+            while !RESUME.load(Ordering::SeqCst) {
+                unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            }
+            RESUME.store(false, Ordering::SeqCst);
+            SUSPENDED.store(false, Ordering::SeqCst);
+        }
+
+        pub fn install() {
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = handler as extern "C" fn(i32) as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+            }
+            set_lock_flag_hook(Some(lock_flag));
+        }
+    }
+
+    /// Suspend a thread that is busy taking and dropping the region lock,
+    /// `rounds` times, and each time check that another thread can still
+    /// take the lock while it is suspended. Returns (wedged rounds,
+    /// signals the library deferred).
+    fn suspend_lock_holder(rounds: u32, ignore_flag: bool) -> (u32, u64) {
+        setup();
+        usr1::install();
+        usr1::IGNORE_FLAG.store(ignore_flag, Ordering::SeqCst);
+        usr1::SUSPENDS.store(0, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let busy = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let tid = unsafe { libc::gettid() } as u32;
+                usr1::TARGET.store(tid, Ordering::SeqCst);
+                tx.send(tid).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    // create and close each take the region lock.
+                    let e = create_event(false, false).unwrap();
+                    assert!(close(e));
+                }
+            })
+        };
+        let tid = rx.recv().unwrap();
+        let deferred0 = test_counter(20);
+        let mut wedged = 0;
+        for round in 0..rounds {
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid as i32, libc::SIGUSR1) };
+            let start = std::time::Instant::now();
+            while !usr1::SUSPENDED.load(Ordering::SeqCst) {
+                assert!(start.elapsed() < Duration::from_secs(5), "round {round}: SIGUSR1 lost");
+                std::hint::spin_loop();
+            }
+            // Another thread must get the region lock while the target is
+            // suspended.
+            let probe = thread::spawn(|| {
+                let e = create_event(false, false).unwrap();
+                assert!(close(e));
+            });
+            let start = std::time::Instant::now();
+            while !probe.is_finished() && start.elapsed() < Duration::from_millis(300) {
+                thread::sleep(Duration::from_micros(200));
+            }
+            if !probe.is_finished() {
+                wedged += 1;
+            }
+            usr1::RESUME.store(true, Ordering::SeqCst);
+            while usr1::SUSPENDED.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            probe.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        busy.join().unwrap();
+        usr1::TARGET.store(0, Ordering::SeqCst);
+        usr1::IGNORE_FLAG.store(false, Ordering::SeqCst);
+        set_lock_flag_hook(None);
+        assert_eq!(usr1::SUSPENDS.load(Ordering::SeqCst), rounds, "every SIGUSR1 suspends exactly once");
+        (wedged, test_counter(20) - deferred0)
+    }
+
+    #[test]
+    fn sigusr1_in_region_lock_is_deferred_not_lost() {
+        let (wedged, deferred) = suspend_lock_holder(300, false);
+        eprintln!("300 suspends: {wedged} wedged, {deferred} deferred inside the lock");
+        assert_eq!(wedged, 0, "a thread suspended inside the region lock wedged it");
+        assert!(deferred > 0, "no SIGUSR1 landed inside the lock; the test proved nothing");
+    }
+
+    /// Negative control for the test above: a handler that ignores the flag
+    /// suspends the thread inside the lock and wedges it.
+    #[test]
+    fn sigusr1_in_region_lock_wedges_without_deferral() {
+        let (wedged, _) = suspend_lock_holder(300, true);
+        eprintln!("300 suspends, flag ignored: {wedged} wedged");
+        assert!(wedged > 0, "no round wedged; the deferral test cannot tell a fix from luck");
+    }
+
     /// No lost wakeups under contention. Exactly as many units are released
     /// as consumers need, so a wake spent on a thread that never takes its
     /// unit would leave a consumer parked forever: every consumer must
