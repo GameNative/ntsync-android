@@ -72,6 +72,313 @@ mod tests {
         assert!(close(h));
     }
 
+    // ---- Budgeted wakes: a signal op wakes only as many single-object
+    // waiters as it can satisfy, oldest first; everyone else as before. ----
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Park `n` single-object waiters on `h`, one at a time so their order
+    /// on the list is known. Each pushes its id to `order` once it acquires.
+    fn park_single_waiters(
+        h: u32,
+        n: usize,
+        owner_base: u32,
+        order: &Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> Vec<thread::JoinHandle<()>> {
+        let mut joins = Vec::new();
+        for i in 0..n {
+            let order = order.clone();
+            joins.push(thread::spawn(move || {
+                let out = wait_any(&[h], owner_base + i as u32, None, 0);
+                assert!(matches!(out, WaitOutcome::Signaled { index: 0, .. }));
+                order.lock().unwrap().push(i);
+            }));
+            wait_until("waiter to park", || test_waiter_counts(h).0 as usize == i + 1);
+        }
+        joins
+    }
+
+    #[test]
+    fn semaphore_release_wakes_only_released_count() {
+        setup();
+        let h = create_semaphore(0, 10).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(h, 4, 9100, &order);
+
+        sem_release(h, 1).unwrap();
+        wait_until("one waiter to acquire", || order.lock().unwrap().len() == 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(order.lock().unwrap().len(), 1, "release(1) satisfied more than one waiter");
+        assert_eq!(test_waiter_counts(h), (3, 0), "the other waiters must stay parked");
+
+        sem_release(h, 2).unwrap();
+        wait_until("two more waiters", || order.lock().unwrap().len() == 3);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(test_waiter_counts(h), (1, 0));
+
+        sem_release(h, 1).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(read_sem(h).unwrap().0, 0);
+        assert!(close(h));
+    }
+
+    #[test]
+    fn single_waiters_are_woken_oldest_first() {
+        setup();
+        let h = create_semaphore(0, 10).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(h, 5, 9200, &order);
+        for k in 1..=5 {
+            sem_release(h, 1).unwrap();
+            wait_until("next waiter", || order.lock().unwrap().len() == k);
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+        assert!(close(h));
+    }
+
+    #[test]
+    fn auto_event_wakes_one_manual_event_wakes_all() {
+        setup();
+        let auto = create_event(false, false).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(auto, 3, 9300, &order);
+        event_set(auto).unwrap();
+        wait_until("one auto waiter", || order.lock().unwrap().len() == 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(order.lock().unwrap().len(), 1);
+        assert_eq!(test_waiter_counts(auto), (2, 0));
+        // A set that lands while the event is still signaled is a no-op, as
+        // on Windows; keep setting until everyone got through.
+        let start = std::time::Instant::now();
+        while order.lock().unwrap().len() < 3 {
+            let _ = event_set(auto);
+            thread::sleep(Duration::from_millis(1));
+            assert!(start.elapsed() < Duration::from_secs(10), "auto-event waiter stranded");
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert!(close(auto));
+
+        let manual = create_event(true, false).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(manual, 3, 9310, &order);
+        event_set(manual).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(order.lock().unwrap().len(), 3);
+        assert!(close(manual));
+    }
+
+    #[test]
+    fn mutex_unlock_hands_over_to_one_waiter() {
+        setup();
+        let m = create_mutex(9400, 1).unwrap();
+        let inside = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut joins = Vec::new();
+        for i in 0..4u32 {
+            let (inside, done) = (inside.clone(), done.clone());
+            joins.push(thread::spawn(move || {
+                let me = 9401 + i;
+                assert!(is_signaled(wait_any(&[m], me, None, 0), 0));
+                assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two owners at once");
+                thread::sleep(Duration::from_millis(2));
+                inside.fetch_sub(1, Ordering::SeqCst);
+                mutex_unlock(m, me).unwrap();
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        wait_until("all mutex waiters parked", || test_waiter_counts(m).0 == 4);
+        mutex_unlock(m, 9400).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 4);
+        assert!(close(m));
+    }
+
+    #[test]
+    fn multi_object_and_alertable_waiters_are_always_woken() {
+        setup();
+        let sem = create_semaphore(0, 10).unwrap();
+        let other = create_event(true, false).unwrap();
+        let alert = create_event(true, false).unwrap();
+        let got = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut joins = Vec::new();
+        {
+            let got = got.clone();
+            joins.push(thread::spawn(move || {
+                assert!(is_signaled(wait_any(&[sem, other], 9500, None, 0), 0));
+                got.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        wait_until("multi waiter", || test_waiter_counts(sem).1 == 1);
+        {
+            let got = got.clone();
+            joins.push(thread::spawn(move || {
+                assert!(is_signaled(wait_any(&[sem], 9501, None, alert), 0));
+                got.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        wait_until("alertable waiter", || test_waiter_counts(sem).1 == 2);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        joins.extend(park_single_waiters(sem, 2, 9510, &order));
+        assert_eq!(test_waiter_counts(sem), (2, 2));
+
+        // Release one unit: both non-single waiters are woken (one takes it,
+        // the other parks again) and both single ones stay parked.
+        sem_release(sem, 1).unwrap();
+        wait_until("one acquire", || got.load(Ordering::SeqCst) + order.lock().unwrap().len() as u32 == 1);
+        thread::sleep(Duration::from_millis(50));
+        sem_release(sem, 3).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(got.load(Ordering::SeqCst) + order.lock().unwrap().len() as u32, 4);
+        for h in [sem, other, alert] {
+            assert!(close(h));
+        }
+    }
+
+    /// No lost wakeups under contention. Exactly as many units are released
+    /// as consumers need, so a wake spent on a thread that never takes its
+    /// unit would leave a consumer parked forever: every consumer must
+    /// finish within the deadline. Thieves steal units with zero-timeout
+    /// waits and give them back, so woken waiters regularly lose the race.
+    #[test]
+    fn stress_budgeted_wakes_never_strand_a_waiter() {
+        setup();
+        const PER: u32 = 300;
+        let sem = create_semaphore(0, 100_000).unwrap();
+        let other = create_event(true, false).unwrap();
+        let alert = create_event(true, false).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let taken = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut consumers = Vec::new();
+        // 5 single-object consumers, 1 multi-object, 1 alertable.
+        for i in 0..7u32 {
+            let taken = taken.clone();
+            consumers.push(thread::spawn(move || {
+                for _ in 0..PER {
+                    let out = match i {
+                        5 => wait_any(&[sem, other], 9600 + i, None, 0),
+                        6 => wait_any(&[sem], 9600 + i, None, alert),
+                        _ => wait_any(&[sem], 9600 + i, None, 0),
+                    };
+                    assert!(is_signaled(out, 0), "consumer {i}: {out:?}");
+                    taken.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        let mut thieves = Vec::new();
+        for t in 0..2u32 {
+            let stop = stop.clone();
+            thieves.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if is_signaled(wait_any(&[sem], 9700 + t, Some(Duration::ZERO), 0), 0) {
+                        std::hint::spin_loop();
+                        sem_release(sem, 1).unwrap();
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        let total = PER * 7;
+        let mut released = 0;
+        let mut k = 0u32;
+        while released < total {
+            let n = (1 + k % 4).min(total - released);
+            sem_release(sem, n).unwrap();
+            released += n;
+            k += 1;
+            if k % 16 == 0 {
+                thread::sleep(Duration::from_micros(200));
+            }
+        }
+        let start = std::time::Instant::now();
+        while taken.load(Ordering::Relaxed) < total {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "lost wakeup: {} of {total} units taken, sem count {:?}, waiters {:?}",
+                taken.load(Ordering::Relaxed),
+                read_sem(sem),
+                test_waiter_counts(sem)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        for c in consumers {
+            c.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in thieves {
+            t.join().unwrap();
+        }
+        assert_eq!(read_sem(sem).unwrap().0, 0);
+        for h in [sem, other, alert] {
+            assert!(close(h));
+        }
+    }
+
+    /// Mutex and auto-reset event handoffs under contention: mutual
+    /// exclusion holds and nobody is left parked.
+    #[test]
+    fn stress_mutex_and_auto_event_handoff() {
+        setup();
+        let m = create_mutex(0, 0).unwrap();
+        let ev = create_event(false, false).unwrap();
+        let inside = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut joins = Vec::new();
+        for i in 0..6u32 {
+            let inside = inside.clone();
+            joins.push(thread::spawn(move || {
+                let me = 9800 + i;
+                for _ in 0..500 {
+                    assert!(is_signaled(wait_any(&[m], me, None, 0), 0));
+                    assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two mutex owners");
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                    mutex_unlock(m, me).unwrap();
+                }
+            }));
+        }
+        // Auto-event ping-pong: each consumer waits, the producer sets until
+        // every wait has been satisfied.
+        let got = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        for i in 0..4u32 {
+            let got = got.clone();
+            joins.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    assert!(is_signaled(wait_any(&[ev], 9900 + i, None, 0), 0));
+                    got.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        let start = std::time::Instant::now();
+        while got.load(Ordering::SeqCst) < 800 {
+            let _ = event_set(ev);
+            std::thread::yield_now();
+            assert!(start.elapsed() < Duration::from_secs(20), "auto-event waiter stranded at {}", got.load(Ordering::SeqCst));
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        for h in [m, ev] {
+            assert!(close(h));
+        }
+    }
+
     #[test]
     fn handle_zero_is_never_allocated() {
         setup();
