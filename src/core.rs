@@ -33,7 +33,7 @@
 //! ntsync_sweep_dead().
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -355,26 +355,38 @@ impl Region {
         let mut waited = std::time::Duration::ZERO;
         // Wine suspends threads with SIGUSR1; if it lands while we hold the
         // shared region mutex the holder stays parked and every process
-        // (including wineserver) wedges on the lock. Defer it until release.
-        // Consumers without a SIGUSR1 handler can set
-        // NTSYNC_NO_SIGUSR1_BLOCK=1 to skip the two pthread_sigmask
-        // syscalls per lock acquisition.
-        let old_mask = if sigusr1_block_enabled() {
-            let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-            let mut block = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-            unsafe {
-                libc::sigemptyset(&mut block);
-                libc::sigaddset(&mut block, libc::SIGUSR1);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old_mask);
+        // (including wineserver) wedges on the lock. Defer it until release:
+        // through the host's per-thread lock flag when it installed one
+        // (ntsync_set_lock_flag_hook: its SIGUSR1 handler holds the signal
+        // back while the flag is set, no syscalls), else by blocking SIGUSR1
+        // for the duration (two pthread_sigmask syscalls). Consumers without
+        // a SIGUSR1 handler can set NTSYNC_NO_SIGUSR1_BLOCK=1 to skip both.
+        let defer = match lock_flag() {
+            Some(flag) => {
+                flag.store(LOCK_FLAG_HELD, Ordering::SeqCst);
+                Defer::Flag(flag)
             }
-            Some(old_mask)
-        } else {
-            None
+            None if sigusr1_block_enabled() => {
+                let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                let mut block = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                unsafe {
+                    libc::sigemptyset(&mut block);
+                    libc::sigaddset(&mut block, libc::SIGUSR1);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old_mask);
+                }
+                Defer::Mask(old_mask)
+            }
+            None => Defer::Nothing,
         };
-        let mut tries = 0u32;
+        // A failed trylock is the contention count; it costs one CAS, which
+        // pthread_mutex_lock would try first anyway.
+        let first = unsafe { libc::pthread_mutex_trylock(lock) };
+        let mut tries = if first == libc::EBUSY { 1u32 } else { 0 };
         loop {
             tries += 1;
-            let ret = if debug {
+            let ret = if tries == 1 {
+                first
+            } else if debug {
                 // Poll with a timeout so a stuck holder can be logged.
                 let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
                 unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
@@ -401,7 +413,7 @@ impl Region {
                         (*h).lock_owner_tid = current_tid();
                     }
                 }
-                return Ok(RegionGuard { region: self, old_mask });
+                return Ok(RegionGuard { region: self, defer });
             }
             if ret == libc::ETIMEDOUT {
                 waited += std::time::Duration::from_secs(5);
@@ -417,20 +429,83 @@ impl Region {
                 continue;
             }
             if ret != libc::EINTR {
-                if let Some(old_mask) = old_mask {
-                    unsafe {
-                        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
-                    };
-                }
+                defer.end();
                 return Err(-ret);
             }
         }
     }
 }
 
+/// How a region-lock holder keeps SIGUSR1 (Wine's suspend) from parking it
+/// inside the lock.
+enum Defer {
+    /// No SIGUSR1 handler to worry about (NTSYNC_NO_SIGUSR1_BLOCK=1).
+    Nothing,
+    /// SIGUSR1 blocked; the previous mask is restored on release.
+    Mask(libc::sigset_t),
+    /// The host's per-thread lock flag is set; its handler defers SIGUSR1
+    /// while it is, and marks it pending.
+    Flag(&'static AtomicI32),
+}
+
+impl Defer {
+    /// Called once the lock is released (or was never taken).
+    fn end(&self) {
+        match self {
+            Defer::Nothing => {}
+            Defer::Mask(old_mask) => unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, old_mask, std::ptr::null_mut());
+            },
+            Defer::Flag(flag) => {
+                // Atomic swap: a SIGUSR1 that lands before it sees the flag
+                // set and leaves PENDING for this read; one after it finds the
+                // flag clear and suspends the thread right there, outside the
+                // lock. Either way it is delivered exactly once.
+                if flag.swap(0, Ordering::SeqCst) & LOCK_FLAG_SIGNAL_PENDING != 0 {
+                    stat_bump(20); // sigusr1_deferred
+                    unsafe { libc::raise(libc::SIGUSR1) };
+                }
+            }
+        }
+    }
+}
+
+/// ntsync_set_lock_flag_hook protocol: the library stores LOCK_FLAG_HELD in
+/// the thread's flag before it takes the region lock and swaps it back to 0
+/// after the unlock. The host's SIGUSR1 handler, finding it nonzero, ORs in
+/// LOCK_FLAG_SIGNAL_PENDING and returns without suspending; the library then
+/// re-raises SIGUSR1 at the swap.
+pub const LOCK_FLAG_HELD: i32 = 1;
+pub const LOCK_FLAG_SIGNAL_PENDING: i32 = 2;
+
+/// Host callback returning the calling thread's lock flag (or null to fall
+/// back to masking SIGUSR1 for this acquisition).
+pub type LockFlagHook = unsafe extern "C" fn() -> *mut i32;
+
+static LOCK_FLAG_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Install (or with None remove) the host's lock-flag callback.
+pub fn set_lock_flag_hook(hook: Option<LockFlagHook>) {
+    LOCK_FLAG_HOOK.store(hook.map_or(0, |f| f as usize), Ordering::SeqCst);
+}
+
+fn lock_flag() -> Option<&'static AtomicI32> {
+    let f = LOCK_FLAG_HOOK.load(Ordering::Relaxed);
+    if f == 0 {
+        return None;
+    }
+    let hook: LockFlagHook = unsafe { std::mem::transmute::<usize, LockFlagHook>(f) };
+    let p = unsafe { hook() };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(p as *const AtomicI32) })
+    }
+}
+
 struct RegionGuard<'a> {
     region: &'a Region,
-    old_mask: Option<libc::sigset_t>,
+    defer: Defer,
 }
 
 impl Drop for RegionGuard<'_> {
@@ -441,10 +516,8 @@ impl Drop for RegionGuard<'_> {
             (*h).lock_owner_tid = 0;
             let lock = &(*h).lock as *const libc::pthread_mutex_t as *mut _;
             libc::pthread_mutex_unlock(lock);
-            if let Some(old_mask) = &self.old_mask {
-                libc::pthread_sigmask(libc::SIG_SETMASK, old_mask, std::ptr::null_mut());
-            }
         }
+        self.defer.end();
     }
 }
 
@@ -472,11 +545,13 @@ fn futex_wait(addr: *const AtomicU32, expected: u32, timeout: Option<Duration>) 
     }
 }
 
-fn futex_wake(addr: *const AtomicU32) {
+/// Returns how many threads the kernel woke: 1 if the waiter was parked on
+/// the word, 0 if it was not (spinning, between its seq sample and the
+/// futex call, or gone).
+fn futex_wake(addr: *const AtomicU32) -> u32 {
     // Each head node is slept on by exactly one waiter, so wake one.
-    unsafe {
-        libc::syscall(libc::SYS_futex, addr as *const u32, libc::FUTEX_WAKE, 1, 0, 0, 0);
-    }
+    let ret = unsafe { libc::syscall(libc::SYS_futex, addr as *const u32, libc::FUTEX_WAKE, 1, 0, 0, 0) };
+    if ret > 0 { ret as u32 } else { 0 }
 }
 
 /// Pop a node from the free list, or hand out a never-before-used node
@@ -547,13 +622,34 @@ fn node_detach(r: &Region, idx: u32) {
     }
 }
 
+/// `registered` values. Readers only ever test it against 0, so a builder
+/// that predates REG_SINGLE treats both values as "on the list", and this
+/// one treats an older builder's 1 as a waiter it must always wake: the
+/// shared layout is unchanged in both directions.
+const REG_MULTI: u32 = 1;
+/// The node is the only one of its waiter: a single-object, non-alertable
+/// wait. Such a waiter is satisfied by this object alone and, once woken,
+/// always attempts to acquire it, so a signal op may wake only as many of
+/// them as it can satisfy (see wake_object).
+const REG_SINGLE: u32 = 2;
+/// An object node of a wait-any waiter that has other nodes too (several
+/// objects, or an alert event). It is woken within the budget like a
+/// REG_SINGLE one, but such a waiter can return without taking the object it
+/// was woken for (the alert fired, or an earlier object in its list was
+/// signaled). It then passes the wake on to the next waiter: see the `owed`
+/// mask in wait().
+const REG_ANY: u32 = 3;
+
+/// Wake budget meaning "every waiter".
+const WAKE_ALL: u32 = u32::MAX;
+
 /// Register `node` on object `obj_idx`'s waiter list. Caller holds the lock.
-fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32) {
+fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32, reg: u32) {
     let node = r.node_ptr(idx);
     let slot = r.slot_ptr(obj_idx);
     unsafe {
         let old_head = (*slot).waiter_head;
-        (*node).registered = 1;
+        (*node).registered = reg;
         (*node).obj = obj_idx;
         (*node).wait_word = wait_word;
         (*node).obj_prev = NIL;
@@ -565,16 +661,54 @@ fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32) {
     }
 }
 
-/// Wake every waiter registered on an object (kernel: wake_up(&obj->q)).
-/// Caller holds the lock. Each waiter is detached and its head seq bumped;
-/// it re-checks conditions when scheduled.
-fn wake_object(r: &Region, obj_idx: u32) {
+/// Wake the waiters registered on an object. Caller holds the lock.
+///
+/// `budget` caps how many wait-any waiters (REG_SINGLE, REG_ANY) are woken:
+/// the units a signal op made available (semaphore release count, 1 for an
+/// auto-reset event or a freed mutex). Waking more of them only makes the
+/// extras run, fail to acquire, take the region lock twice and park again,
+/// all while the signaler pays one futex syscall per waiter - Unity's job
+/// system, which releases a semaphore to N parked workers many times per
+/// frame, spent about a fifth of its main thread there. Wine waits
+/// alertably by default, so those workers are REG_ANY, not REG_SINGLE.
+///
+/// A woken wait-any waiter retries the acquire (wait() re-registers and
+/// calls try_satisfy under the lock before any timeout), so each unit of
+/// budget lands on a thread that takes the object, finds it already taken,
+/// or - REG_ANY only - returns for another reason and wakes the next waiter
+/// in its place. The budget is charged only when futex_wake reports a
+/// thread actually woken: a waiter that is spinning, about to park, or dead
+/// costs no budget, and the next one is woken too.
+///
+/// Wait-all waiters and alert-event nodes (REG_MULTI) are always woken, as
+/// before. WAKE_ALL wakes everyone (close, pulse, manual-reset events,
+/// reaping).
+///
+/// Waiters are woken oldest first (node_register pushes at the head), so a
+/// contended mutex or semaphore cannot starve an early waiter.
+fn wake_object(r: &Region, obj_idx: u32, budget: u32, mut later: Option<&mut PendingWakes<'_>>) {
     let debug = debug_enabled();
+    let mut left = if wake_all_forced() { WAKE_ALL } else { budget };
     let slot = r.slot_ptr(obj_idx);
     let mut idx = unsafe { (*slot).waiter_head };
+    let mut guard = 0;
+    while idx != NIL && guard < NODE_COUNT {
+        let next = unsafe { (*r.node_ptr(idx)).obj_next };
+        if next == NIL {
+            break;
+        }
+        idx = next;
+        guard += 1;
+    }
     while idx != NIL {
         let node = r.node_ptr(idx);
-        let (next, word) = unsafe { ((*node).obj_next, (*node).wait_word) };
+        let (prev, word, reg) = unsafe { ((*node).obj_prev, (*node).wait_word, (*node).registered) };
+        let budgeted = reg == REG_SINGLE || reg == REG_ANY;
+        if budgeted && left == 0 {
+            stat_bump(16); // wakes_deferred
+            idx = prev;
+            continue;
+        }
         node_detach(r, idx);
         let head = r.node_ptr(word);
         unsafe {
@@ -582,9 +716,130 @@ fn wake_object(r: &Region, obj_idx: u32) {
                 (*head).wake_ts.store(monotonic_ns(), Ordering::Relaxed);
             }
             (*head).seq.fetch_add(1, Ordering::Release);
-            futex_wake(&(*head).seq);
         }
-        idx = next;
+        if let Some(pw) = later.as_deref_mut().filter(|pw| pw.n < PENDING_WAKES) {
+            // Woken after the unlock (PendingWakes::flush), so the thread
+            // does not run straight into the lock we still hold. The unit is
+            // charged now; flush gives it back if nobody was parked.
+            pw.push(obj_idx, word, budgeted && left != WAKE_ALL);
+            if budgeted && left != WAKE_ALL {
+                left -= 1;
+            }
+        } else {
+            let woken = futex_wake(unsafe { &(*head).seq });
+            stat_add(15, woken as u64); // threads_woken
+            if budgeted && woken > 0 && left != WAKE_ALL {
+                left -= 1;
+            }
+        }
+        idx = prev;
+    }
+}
+
+/// Most wakes one locked walk defers past the unlock; any beyond are woken
+/// inline. A semaphore release wakes at most its count, an event or mutex 1.
+const PENDING_WAKES: usize = 16;
+
+/// Futex wakes collected under the region lock and issued after it is
+/// dropped (flush, or Drop: declare it before the guard so it drops after).
+///
+/// A late FUTEX_WAKE is safe: the node was detached and its seq bumped under
+/// the lock, so its waiter cannot sleep through it (futex_wait returns EAGAIN
+/// on the changed seq); if the waiter already left and the node was reused,
+/// the new owner sees a spurious wake, re-checks under the lock and parks
+/// again.
+///
+/// A budgeted wake is charged when its node is detached. If futex_wake then
+/// reports nobody parked on the word, that waiter was spinning, between its
+/// seq sample and futex_wait (it retries and takes the unit itself), or gone
+/// (a dead process or a terminated thread, which never will). The walk
+/// cannot tell these apart, so it does what the inline walk did: wakes one
+/// more waiter for each such unit, in a second locked walk. Over-waking is
+/// safe; stranding a unit is not.
+struct PendingWakes<'a> {
+    r: &'a Region,
+    n: usize,
+    obj: [u32; PENDING_WAKES],
+    word: [u32; PENDING_WAKES],
+    budgeted: u32, // bit i: entry i was charged to a budget
+}
+
+impl<'a> PendingWakes<'a> {
+    fn new(r: &'a Region) -> Self {
+        PendingWakes { r, n: 0, obj: [0; PENDING_WAKES], word: [0; PENDING_WAKES], budgeted: 0 }
+    }
+
+    fn push(&mut self, obj: u32, word: u32, budgeted: bool) {
+        self.obj[self.n] = obj;
+        self.word[self.n] = word;
+        if budgeted {
+            self.budgeted |= 1 << self.n;
+        }
+        self.n += 1;
+    }
+
+    /// Issue the collected wakes. Call with the region lock released.
+    fn flush(&mut self) {
+        let r = self.r;
+        while self.n > 0 {
+            // Units whose budgeted wake found nobody parked, per object.
+            let mut redo = [(0u32, 0u32); PENDING_WAKES];
+            let mut nredo = 0;
+            for i in 0..self.n {
+                let woken = futex_wake(unsafe { &(*r.node_ptr(self.word[i])).seq });
+                stat_add(15, woken as u64); // threads_woken
+                if woken == 0 && self.budgeted & (1 << i) != 0 {
+                    stat_bump(18); // wakes_unparked
+                    match redo[..nredo].iter_mut().find(|(o, _)| *o == self.obj[i]) {
+                        Some(e) => e.1 += 1,
+                        None => {
+                            redo[nredo] = (self.obj[i], 1);
+                            nredo += 1;
+                        }
+                    }
+                }
+            }
+            self.n = 0;
+            self.budgeted = 0;
+            if nredo == 0 {
+                return;
+            }
+            let slot_has_waiters =
+                |o: u32| ld32(unsafe { &(*r.slot_ptr(o)).waiter_head }) != NIL;
+            if !redo[..nredo].iter().any(|&(o, _)| slot_has_waiters(o)) {
+                return;
+            }
+            stat_bump(19); // wake_rewalks
+            if let Ok(_g) = r.lock_guard() {
+                for &(o, units) in &redo[..nredo] {
+                    wake_object(r, o, units, Some(self));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PendingWakes<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Pass on the wakes a wait-any waiter was given for objects it is leaving
+/// without having taken: bit i of `owed` is handles[i]. Each was one unit of
+/// some signal op's budget, so one more waiter is woken per object. If the
+/// unit is gone by now the woken waiter just parks again. Caller holds the
+/// lock.
+fn forward_wakes(r: &Region, handles: &[u32], owed: u64, taken: Option<u32>, later: &mut PendingWakes<'_>) {
+    let mut bits = owed;
+    while bits != 0 {
+        let i = bits.trailing_zeros();
+        bits &= bits - 1;
+        if taken == Some(i) {
+            continue;
+        }
+        stat_bump(17); // wakes_forwarded
+        wake_object(r, handles[i as usize] & INDEX_MASK, 1, Some(&mut *later));
     }
 }
 
@@ -592,19 +847,31 @@ fn wake_object(r: &Region, obj_idx: u32) {
 /// The race with a waiter that registers just after our NIL load is closed
 /// by the waiter re-checking acquirability under the region lock before it
 /// sleeps (registration and wake walks are mutually exclusive).
-fn wake_waiters_if_any(r: &Region, obj_idx: u32) {
+fn wake_waiters_if_any(r: &Region, obj_idx: u32, budget: u32) {
     let slot = unsafe { &*r.slot_ptr(obj_idx) };
     if ld32(&slot.waiter_head) == NIL {
         return;
     }
     stat_bump(8); // wake_walks
+    let mut later = PendingWakes::new(r);
     if let Ok(_g) = r.lock_guard() {
-        wake_object(r, obj_idx);
+        wake_object(r, obj_idx, budget, Some(&mut later));
     }
+    later.flush();
 }
 
 fn current_tid() -> u32 {
-    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+    // bionic's gettid() returns the tid cached in the thread struct; the raw
+    // syscall cost one kernel entry per region-lock acquisition under
+    // NTSYNC_DEBUG.
+    #[cfg(target_os = "android")]
+    unsafe {
+        libc::gettid() as u32
+    }
+    #[cfg(not(target_os = "android"))]
+    unsafe {
+        libc::syscall(libc::SYS_gettid) as u32
+    }
 }
 
 fn open_and_map(path: &str) -> Result<Region, i32> {
@@ -917,7 +1184,7 @@ pub fn close(handle: u32) -> bool {
         (&*(&(*slot).state as *const u32 as *const AtomicU32)).store(SLOT_FREE, Ordering::Release);
         (*slot).generation = (*slot).generation.wrapping_add(1);
     }
-    wake_object(r, handle & INDEX_MASK);
+    wake_object(r, handle & INDEX_MASK, WAKE_ALL, None);
     true
 }
 
@@ -937,7 +1204,7 @@ pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
         };
         match cas64(w0, w, pack_sem(sum, max)) {
             Ok(_) => {
-                wake_waiters_if_any(r, handle & INDEX_MASK);
+                wake_waiters_if_any(r, handle & INDEX_MASK, count);
                 return Ok(cur);
             }
             Err(_) => continue,
@@ -958,7 +1225,10 @@ pub fn event_set(handle: u32) -> Result<u32, Error> {
         }
         match cas64(w0, w, w | 1) {
             Ok(_) => {
-                wake_waiters_if_any(r, handle & INDEX_MASK);
+                // An auto-reset event satisfies one waiter; a manual-reset
+                // one stays signaled and satisfies all of them.
+                let manual = (w >> 32) & 1 != 0;
+                wake_waiters_if_any(r, handle & INDEX_MASK, if manual { WAKE_ALL } else { 1 });
                 return Ok(0);
             }
             Err(_) => continue,
@@ -999,7 +1269,7 @@ pub fn event_pulse(handle: u32) -> Result<u32, Error> {
         st64(&(*slot).w0, ld64(&(*slot).w0) & !1u64);
         prev
     };
-    wake_object(r, handle & INDEX_MASK);
+    wake_object(r, handle & INDEX_MASK, WAKE_ALL, None);
     Ok(prev)
 }
 
@@ -1027,7 +1297,7 @@ pub fn mutex_unlock(handle: u32, owner: u32) -> Result<u32, Error> {
         match cas64(w0, w, new) {
             Ok(_) => {
                 if freed {
-                    wake_waiters_if_any(r, handle & INDEX_MASK);
+                    wake_waiters_if_any(r, handle & INDEX_MASK, 1);
                 }
                 return Ok(count);
             }
@@ -1053,7 +1323,7 @@ pub fn mutex_kill(handle: u32, owner: u32) -> Result<(), Error> {
         }
         match cas64(w0, w, pack_mutex(0, 0, true)) {
             Ok(_) => {
-                wake_waiters_if_any(r, handle & INDEX_MASK);
+                wake_waiters_if_any(r, handle & INDEX_MASK, 1);
                 return Ok(());
             }
             Err(_) => continue,
@@ -1243,7 +1513,7 @@ fn debug_log(msg: &str) {
 mod stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub const NAMES: [&str; 15] = [
+    pub const NAMES: [&str; 21] = [
         "wait_calls",        // total wait_any/wait_all calls
         "wait_fast_ok",      // satisfied without any lock
         "wait_blocked",      // actually slept on a futex
@@ -1259,12 +1529,20 @@ mod stats {
         "wake_lat_us_max",   // worst wake latency, us
         "spin_wins",         // waits satisfied during the pre-sleep spin
         "spin_exhausted",    // spins that still ended in a futex sleep
+        "threads_woken",     // waiters a wake walk actually woke (futex_wake > 0)
+        "wakes_deferred",    // wait-any waiters left parked: budget spent
+        "wakes_forwarded",   // wakes passed on by a waiter that left without the object
+        "wakes_unparked",    // budgeted wakes issued after the unlock that found nobody parked
+        "wake_rewalks",      // second locked walks to re-issue those units
+        "sigusr1_deferred",  // SIGUSR1s the host held back during a region lock, re-raised on release
     ];
-    pub static COUNTERS: [AtomicU64; 15] = [
+    pub static COUNTERS: [AtomicU64; 21] = [
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
     ];
 
     #[inline]
@@ -1501,6 +1779,10 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
     let mut entry_seqs = [0u64; MAX_WAIT_COUNT];
     let n_nodes = handles.len() + (alert != 0) as usize;
     let mut nodes = NodeSet::new();
+    // Object nodes this thread detached itself after its last park (timeout,
+    // EINTR, or a wake that came through another node). Every other node
+    // found detached at the top of the loop was detached by a signaler.
+    let mut self_detached = 0u64;
 
     // ---- Fast path: validate and try to acquire without any lock. ----
     let fast_valid = handles.iter().enumerate().all(|(i, h)| {
@@ -1536,6 +1818,10 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
     // re-validates authoritatively (a close racing the fast path fails it).
 
     loop {
+        // Wakes passed on below are issued after the guard drops: `later` is
+        // declared first, so it drops (and flushes) after `_g` on every
+        // return from this iteration.
+        let mut later = PendingWakes::new(r);
         // Take the region lock for the validate/register cycle. Registration
         // and signalers' wake walks are mutually exclusive, and we re-check
         // acquirability under the lock before sleeping, so no wakeup is lost.
@@ -1546,6 +1832,21 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             }
             return WaitOutcome::Invalid;
         };
+
+        // Objects whose signaler woke this wait-any waiter since it last
+        // parked (see REG_ANY). Leaving without taking one of them passes
+        // its wake on; a failed acquire below clears the debt, because the
+        // unit is then gone and this thread parks on the object again.
+        let mut owed = 0u64;
+        if !all && n_nodes > 1 && !nodes.is_empty() {
+            for i in 0..handles.len() {
+                if unsafe { (*r.node_ptr(nodes[i])).registered } == 0 {
+                    owed |= 1 << i;
+                }
+            }
+            owed &= !self_detached;
+        }
+        self_detached = 0;
 
         // Authoritative validation (also catches objects closed mid-wait).
         let mut valid = true;
@@ -1572,6 +1873,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         }
         if !valid {
             waiter_cleanup(r, &mut nodes);
+            forward_wakes(r, handles, owed, None, &mut later);
             return WaitOutcome::Invalid;
         }
 
@@ -1582,6 +1884,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             let slot = r.slot(alert).expect("validated above");
             if ld64(unsafe { &(*slot).w0 }) as u32 != 0 {
                 waiter_cleanup(r, &mut nodes);
+                forward_wakes(r, handles, owed, None, &mut later);
                 return WaitOutcome::Signaled {
                     index: handles.len() as u32,
                     owner_dead: false,
@@ -1609,15 +1912,22 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             }
         }
         let head = nodes[0];
+        let reg = if all {
+            REG_MULTI
+        } else if n_nodes == 1 {
+            REG_SINGLE
+        } else {
+            REG_ANY
+        };
         for (i, h) in handles.iter().enumerate() {
             if unsafe { (*r.node_ptr(nodes[i])).registered } == 0 {
-                node_register(r, nodes[i], h & INDEX_MASK, head);
+                node_register(r, nodes[i], h & INDEX_MASK, head, reg);
             }
         }
         if alert != 0 {
             let an = nodes[handles.len()];
             if unsafe { (*r.node_ptr(an)).registered } == 0 {
-                node_register(r, an, alert & INDEX_MASK, head);
+                node_register(r, an, alert & INDEX_MASK, head, REG_MULTI);
             }
         }
 
@@ -1633,6 +1943,9 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         // Authoritative acquire attempt.
         if let Some(outcome) = try_satisfy(r, handles, owner, &entry_seqs, all) {
             waiter_cleanup(r, &mut nodes);
+            if let WaitOutcome::Signaled { index, .. } = outcome {
+                forward_wakes(r, handles, owed, Some(index), &mut later);
+            }
             return outcome;
         }
 
@@ -1656,6 +1969,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         // or fails immediately with EAGAIN - never a missed wakeup.
         let seq = unsafe { (*r.node_ptr(head)).seq.load(Ordering::Acquire) };
         drop(_g);
+        later.flush();
 
         // Bounded spin before sleeping (NTSYNC_SPIN_ITERS, default 0 = off):
         // a signal that lands within the window is acquired lock-free,
@@ -1816,7 +2130,10 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             .any(|&idx| unsafe { ld32(&(*r.node_ptr(idx)).registered) } != 0);
         if any_registered {
             if let Ok(_g) = r.lock_guard() {
-                for &idx in nodes.iter() {
+                for (i, &idx) in nodes.iter().enumerate() {
+                    if i < handles.len() && unsafe { (*r.node_ptr(idx)).registered } != 0 {
+                        self_detached |= 1 << i;
+                    }
                     node_detach(r, idx);
                 }
             }
@@ -2034,7 +2351,7 @@ fn reap_dead_locked(r: &Region, cands: &[DeadCand], alive: &[bool]) -> u32 {
                 {
                     (*slot).state = SLOT_FREE;
                     (*slot).generation = (*slot).generation.wrapping_add(1);
-                    wake_object(r, c.index);
+                    wake_object(r, c.index, WAKE_ALL, None);
                     freed += 1;
                 }
             }
@@ -2085,6 +2402,13 @@ fn sweep_interval_ns() -> u64 {
 /// opted in. Capped at 100k to bound silly values. Each iteration is a
 /// handful of atomic loads (~10-20ns), so e.g. 200 iters costs ~2-4us
 /// of CPU in exchange for every avoided sleep/wake pair.
+/// NTSYNC_WAKE_ALL=1 makes every signal op wake all of an object's waiters,
+/// as before budgeted wakes existed. Read once.
+fn wake_all_forced() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("NTSYNC_WAKE_ALL").is_ok_and(|v| v == "1"))
+}
+
 fn spin_max_iters() -> u32 {
     static ITERS: OnceLock<u32> = OnceLock::new();
     *ITERS.get_or_init(|| {
@@ -2132,6 +2456,18 @@ fn spin_tail_budget_ns() -> u64 {
             .min(100);
         pct * 10_000_000 // that fraction of a second, in ns
     })
+}
+
+/// Snapshot of the per-process counters (they count with or without
+/// NTSYNC_DEBUG; only the dump thread needs it).
+#[cfg(test)]
+pub(crate) fn test_counter(i: usize) -> u64 {
+    stats::COUNTERS[i].load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn test_counters() -> Vec<(&'static str, u64)> {
+    stats::NAMES.iter().enumerate().map(|(i, n)| (*n, stats::COUNTERS[i].load(Ordering::Relaxed))).collect()
 }
 
 /// Largest burst a thread may bank: its allowance for 10 ms of wall time.
@@ -2396,6 +2732,31 @@ pub(crate) fn test_reap_slot_candidate(cand: (u32, u32, u32), alive: bool) -> u3
     reap_dead_locked(r, &[c], &[alive])
 }
 
+/// Tests: (single-object, other) waiter nodes registered on `handle`.
+/// "Other" counts REG_ANY and REG_MULTI nodes alike.
+#[cfg(test)]
+pub(crate) fn test_waiter_counts(handle: u32) -> (u32, u32) {
+    let Ok(r) = region() else { return (0, 0) };
+    let Ok(_g) = r.lock_guard() else { return (0, 0) };
+    let Some(slot) = r.slot(handle) else { return (0, 0) };
+    let (mut single, mut other) = (0, 0);
+    let mut idx = unsafe { (*slot).waiter_head };
+    let mut guard = 0;
+    while idx != NIL && guard <= NODE_COUNT {
+        guard += 1;
+        let node = r.node_ptr(idx);
+        unsafe {
+            match (*node).registered {
+                REG_SINGLE => single += 1,
+                0 => {}
+                _ => other += 1,
+            }
+            idx = (*node).obj_next;
+        }
+    }
+    (single, other)
+}
+
 /// Tests: (index, pid) of the first node registered on `handle`'s waiter
 /// list, i.e. of the process currently blocked on it.
 #[cfg(test)]
@@ -2478,6 +2839,14 @@ pub(crate) fn test_sweep_clock_ns() -> u64 {
 
 /// Tests: force the auto-sweep rate limiter to consider the interval
 /// elapsed, so the next signal op sweeps regardless of wall time.
+#[cfg(test)]
+pub(crate) fn test_touch_sweep_clock() {
+    if let Ok(r) = region() {
+        let cell = unsafe { &*(&r.header().sweep_ns as *const u64 as *const AtomicU64) };
+        cell.store(monotonic_ns(), Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_reset_sweep_clock() {
     if let Ok(r) = region() {

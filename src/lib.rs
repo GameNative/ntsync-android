@@ -72,6 +72,595 @@ mod tests {
         assert!(close(h));
     }
 
+    // ---- Budgeted wakes: a signal op wakes only as many wait-any waiters
+    // as it can satisfy, oldest first; wait-all waiters as before. ----
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Park `n` single-object waiters on `h`, one at a time so their order
+    /// on the list is known. Each pushes its id to `order` once it acquires.
+    fn park_single_waiters(
+        h: u32,
+        n: usize,
+        owner_base: u32,
+        order: &Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> Vec<thread::JoinHandle<()>> {
+        let mut joins = Vec::new();
+        for i in 0..n {
+            let order = order.clone();
+            joins.push(thread::spawn(move || {
+                let out = wait_any(&[h], owner_base + i as u32, None, 0);
+                assert!(matches!(out, WaitOutcome::Signaled { index: 0, .. }));
+                order.lock().unwrap().push(i);
+            }));
+            wait_until("waiter to park", || test_waiter_counts(h).0 as usize == i + 1);
+        }
+        joins
+    }
+
+    #[test]
+    fn semaphore_release_wakes_only_released_count() {
+        setup();
+        let h = create_semaphore(0, 10).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(h, 4, 9100, &order);
+
+        sem_release(h, 1).unwrap();
+        wait_until("one waiter to acquire", || order.lock().unwrap().len() == 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(order.lock().unwrap().len(), 1, "release(1) satisfied more than one waiter");
+        assert_eq!(test_waiter_counts(h), (3, 0), "the other waiters must stay parked");
+
+        sem_release(h, 2).unwrap();
+        wait_until("two more waiters", || order.lock().unwrap().len() == 3);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(test_waiter_counts(h), (1, 0));
+
+        sem_release(h, 1).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(read_sem(h).unwrap().0, 0);
+        assert!(close(h));
+    }
+
+    #[test]
+    fn single_waiters_are_woken_oldest_first() {
+        setup();
+        let h = create_semaphore(0, 10).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(h, 5, 9200, &order);
+        for k in 1..=5 {
+            sem_release(h, 1).unwrap();
+            wait_until("next waiter", || order.lock().unwrap().len() == k);
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+        assert!(close(h));
+    }
+
+    #[test]
+    fn auto_event_wakes_one_manual_event_wakes_all() {
+        setup();
+        let auto = create_event(false, false).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(auto, 3, 9300, &order);
+        event_set(auto).unwrap();
+        wait_until("one auto waiter", || order.lock().unwrap().len() == 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(order.lock().unwrap().len(), 1);
+        assert_eq!(test_waiter_counts(auto), (2, 0));
+        // A set that lands while the event is still signaled is a no-op, as
+        // on Windows; keep setting until everyone got through.
+        let start = std::time::Instant::now();
+        while order.lock().unwrap().len() < 3 {
+            let _ = event_set(auto);
+            thread::sleep(Duration::from_millis(1));
+            assert!(start.elapsed() < Duration::from_secs(10), "auto-event waiter stranded");
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert!(close(auto));
+
+        let manual = create_event(true, false).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = park_single_waiters(manual, 3, 9310, &order);
+        event_set(manual).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(order.lock().unwrap().len(), 3);
+        assert!(close(manual));
+    }
+
+    #[test]
+    fn mutex_unlock_hands_over_to_one_waiter() {
+        setup();
+        let m = create_mutex(9400, 1).unwrap();
+        let inside = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut joins = Vec::new();
+        for i in 0..4u32 {
+            let (inside, done) = (inside.clone(), done.clone());
+            joins.push(thread::spawn(move || {
+                let me = 9401 + i;
+                assert!(is_signaled(wait_any(&[m], me, None, 0), 0));
+                assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two owners at once");
+                thread::sleep(Duration::from_millis(2));
+                inside.fetch_sub(1, Ordering::SeqCst);
+                mutex_unlock(m, me).unwrap();
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        wait_until("all mutex waiters parked", || test_waiter_counts(m).0 == 4);
+        mutex_unlock(m, 9400).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 4);
+        assert!(close(m));
+    }
+
+    #[test]
+    fn multi_object_and_alertable_waiters_are_woken_within_budget() {
+        setup();
+        let sem = create_semaphore(0, 10).unwrap();
+        let other = create_event(true, false).unwrap();
+        let alert = create_event(true, false).unwrap();
+        let got = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut joins = Vec::new();
+        {
+            let got = got.clone();
+            joins.push(thread::spawn(move || {
+                assert!(is_signaled(wait_any(&[sem, other], 9500, None, 0), 0));
+                got.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        wait_until("multi waiter", || test_waiter_counts(sem).1 == 1);
+        {
+            let got = got.clone();
+            joins.push(thread::spawn(move || {
+                assert!(is_signaled(wait_any(&[sem], 9501, None, alert), 0));
+                got.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        wait_until("alertable waiter", || test_waiter_counts(sem).1 == 2);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        joins.extend(park_single_waiters(sem, 2, 9510, &order));
+        assert_eq!(test_waiter_counts(sem), (2, 2));
+
+        // Release one unit: only the oldest waiter (the multi-object one) is
+        // woken and takes it; the other three stay parked.
+        sem_release(sem, 1).unwrap();
+        wait_until("one acquire", || got.load(Ordering::SeqCst) == 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(test_waiter_counts(sem), (2, 1), "the other waiters must stay parked");
+        assert!(order.lock().unwrap().is_empty());
+        sem_release(sem, 3).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(got.load(Ordering::SeqCst) + order.lock().unwrap().len() as u32, 4);
+        for h in [sem, other, alert] {
+            assert!(close(h));
+        }
+    }
+
+    /// A wait-all waiter may need more than this object, so it is woken
+    /// whatever the budget.
+    #[test]
+    fn wait_all_waiters_are_always_woken() {
+        setup();
+        let sem = create_semaphore(0, 10).unwrap();
+        let gate = create_event(true, true).unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut joins = park_single_waiters(sem, 1, 9550, &order);
+        joins.push(thread::spawn(move || {
+            assert!(matches!(wait_all(&[sem, gate], 9551, None, 0), WaitOutcome::Signaled { .. }));
+        }));
+        wait_until("wait-all waiter", || test_waiter_counts(sem) == (1, 1));
+        // Two units for two waiters: the single one is the oldest and uses
+        // the whole budget of the first release if it is the only one woken.
+        sem_release(sem, 1).unwrap();
+        sem_release(sem, 1).unwrap();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert_eq!(read_sem(sem).unwrap().0, 0);
+        for h in [sem, gate] {
+            assert!(close(h));
+        }
+    }
+
+    /// A wait-any waiter woken for a semaphore unit that returns for another
+    /// reason (its alert fired, or an earlier object in its list was
+    /// signaled) must pass the wake on, or the unit sits in the semaphore
+    /// with the next waiter asleep. `alertable` picks the reason.
+    fn decoy_passes_its_wake_on(alertable: bool, owner_base: u32) {
+        setup();
+        let mut passed_on = 0;
+        for round in 0..200u32 {
+            let sem = create_semaphore(0, 10).unwrap();
+            let ev = create_event(true, false).unwrap();
+            let owner = owner_base + round * 2;
+            // The decoy parks first, so it is the oldest waiter and the one
+            // a release of one unit wakes.
+            let decoy = thread::spawn(move || {
+                let out = if alertable {
+                    wait_any(&[sem], owner, None, ev)
+                } else {
+                    wait_any(&[ev, sem], owner, None, 0)
+                };
+                let sem_index = if alertable { 0 } else { 1 };
+                assert!(matches!(out, WaitOutcome::Signaled { .. }), "decoy: {out:?}");
+                is_signaled(out, sem_index)
+            });
+            wait_until("decoy to park", || test_waiter_counts(sem).1 == 1);
+            let consumer = thread::spawn(move || {
+                assert!(is_signaled(wait_any(&[sem], owner + 1, None, 0), 0));
+            });
+            wait_until("consumer to park", || test_waiter_counts(sem).0 == 1);
+
+            // The release wakes only the decoy. The event lands before the
+            // decoy gets to run, so it returns on the event and leaves the
+            // unit behind.
+            sem_release(sem, 1).unwrap();
+            event_set(ev).unwrap();
+            if decoy.join().unwrap() {
+                // The decoy won the race and took the unit itself.
+                sem_release(sem, 1).unwrap();
+            } else {
+                passed_on += 1;
+            }
+            let start = std::time::Instant::now();
+            while !consumer.is_finished() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "round {round}: consumer left parked, sem count {:?}",
+                    read_sem(sem)
+                );
+                thread::sleep(Duration::from_micros(200));
+            }
+            consumer.join().unwrap();
+            assert_eq!(read_sem(sem).unwrap().0, 0);
+            for h in [sem, ev] {
+                assert!(close(h));
+            }
+        }
+        assert!(passed_on > 0, "no round had the decoy return on the event");
+    }
+
+    #[test]
+    fn alerted_waiter_passes_its_wake_on() {
+        decoy_passes_its_wake_on(true, 9800);
+    }
+
+    #[test]
+    fn waiter_satisfied_by_another_object_passes_its_wake_on() {
+        decoy_passes_its_wake_on(false, 10300);
+    }
+
+    /// A budgeted wake is charged when its node is detached and issued after
+    /// the unlock. If the oldest waiter belongs to a process that died, the
+    /// wake finds nobody parked, and the unit must go to the next waiter
+    /// instead of staying in the semaphore with that waiter asleep.
+    #[test]
+    fn dead_waiter_does_not_strand_a_unit() {
+        setup();
+        let sem = create_semaphore(0, 10).unwrap();
+        // Keep the auto-sweep from purging the dead node before the release.
+        test_touch_sweep_clock();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let _ = wait_any(&[sem], 11001, None, 0);
+            unsafe { libc::_exit(0) };
+        }
+        wait_until("child waiter to park", || test_waiter_counts(sem).0 == 1);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        let live = thread::spawn(move || {
+            assert!(is_signaled(wait_any(&[sem], 11002, Some(Duration::from_secs(10)), 0), 0));
+        });
+        wait_until("live waiter to park", || test_waiter_counts(sem).0 == 2);
+        sem_release(sem, 1).unwrap();
+        let start = std::time::Instant::now();
+        while !live.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(5), "unit stranded behind a dead waiter");
+            thread::sleep(Duration::from_millis(1));
+        }
+        live.join().unwrap();
+        assert_eq!(read_sem(sem).unwrap().0, 0);
+        assert!(close(sem));
+    }
+
+    /// Host cooperation for SIGUSR1 (ntsync_set_lock_flag_hook), modelled on
+    /// Wine: the handler "suspends" the thread (blocks until resumed) unless
+    /// the thread's lock flag is set, in which case it marks the signal
+    /// pending and returns; the library re-raises it after the unlock.
+    mod usr1 {
+        use super::super::core::*;
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+
+        pub static TARGET: AtomicU32 = AtomicU32::new(0);
+        pub static FLAG: AtomicI32 = AtomicI32::new(0);
+        pub static SUSPENDS: AtomicU32 = AtomicU32::new(0);
+        pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
+        pub static RESUME: AtomicBool = AtomicBool::new(false);
+        /// Negative control: the handler suspends regardless of the flag.
+        pub static IGNORE_FLAG: AtomicBool = AtomicBool::new(false);
+
+        pub unsafe extern "C" fn lock_flag() -> *mut i32 {
+            if unsafe { libc::gettid() } as u32 == TARGET.load(Ordering::SeqCst) {
+                FLAG.as_ptr()
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+
+        pub extern "C" fn handler(_: i32) {
+            if !IGNORE_FLAG.load(Ordering::SeqCst) && FLAG.load(Ordering::SeqCst) != 0 {
+                FLAG.fetch_or(LOCK_FLAG_SIGNAL_PENDING, Ordering::SeqCst);
+                return;
+            }
+            SUSPENDS.fetch_add(1, Ordering::SeqCst);
+            SUSPENDED.store(true, Ordering::SeqCst);
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000 };
+            while !RESUME.load(Ordering::SeqCst) {
+                unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            }
+            RESUME.store(false, Ordering::SeqCst);
+            SUSPENDED.store(false, Ordering::SeqCst);
+        }
+
+        pub fn install() {
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = handler as extern "C" fn(i32) as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+            }
+            set_lock_flag_hook(Some(lock_flag));
+        }
+    }
+
+    /// Suspend a thread that is busy taking and dropping the region lock,
+    /// `rounds` times, and each time check that another thread can still
+    /// take the lock while it is suspended. Returns (wedged rounds,
+    /// signals the library deferred).
+    fn suspend_lock_holder(rounds: u32, ignore_flag: bool) -> (u32, u64) {
+        setup();
+        usr1::install();
+        usr1::IGNORE_FLAG.store(ignore_flag, Ordering::SeqCst);
+        usr1::SUSPENDS.store(0, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let busy = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let tid = unsafe { libc::gettid() } as u32;
+                usr1::TARGET.store(tid, Ordering::SeqCst);
+                tx.send(tid).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    // create and close each take the region lock.
+                    let e = create_event(false, false).unwrap();
+                    assert!(close(e));
+                }
+            })
+        };
+        let tid = rx.recv().unwrap();
+        let deferred0 = test_counter(20);
+        let mut wedged = 0;
+        for round in 0..rounds {
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid as i32, libc::SIGUSR1) };
+            let start = std::time::Instant::now();
+            while !usr1::SUSPENDED.load(Ordering::SeqCst) {
+                assert!(start.elapsed() < Duration::from_secs(5), "round {round}: SIGUSR1 lost");
+                std::hint::spin_loop();
+            }
+            // Another thread must get the region lock while the target is
+            // suspended.
+            let probe = thread::spawn(|| {
+                let e = create_event(false, false).unwrap();
+                assert!(close(e));
+            });
+            let start = std::time::Instant::now();
+            while !probe.is_finished() && start.elapsed() < Duration::from_millis(300) {
+                thread::sleep(Duration::from_micros(200));
+            }
+            if !probe.is_finished() {
+                wedged += 1;
+            }
+            usr1::RESUME.store(true, Ordering::SeqCst);
+            while usr1::SUSPENDED.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            probe.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        busy.join().unwrap();
+        usr1::TARGET.store(0, Ordering::SeqCst);
+        usr1::IGNORE_FLAG.store(false, Ordering::SeqCst);
+        set_lock_flag_hook(None);
+        assert_eq!(usr1::SUSPENDS.load(Ordering::SeqCst), rounds, "every SIGUSR1 suspends exactly once");
+        (wedged, test_counter(20) - deferred0)
+    }
+
+    #[test]
+    fn sigusr1_in_region_lock_is_deferred_not_lost() {
+        let (wedged, deferred) = suspend_lock_holder(300, false);
+        eprintln!("300 suspends: {wedged} wedged, {deferred} deferred inside the lock");
+        assert_eq!(wedged, 0, "a thread suspended inside the region lock wedged it");
+        assert!(deferred > 0, "no SIGUSR1 landed inside the lock; the test proved nothing");
+    }
+
+    /// Negative control for the test above: a handler that ignores the flag
+    /// suspends the thread inside the lock and wedges it.
+    #[test]
+    fn sigusr1_in_region_lock_wedges_without_deferral() {
+        let (wedged, _) = suspend_lock_holder(300, true);
+        eprintln!("300 suspends, flag ignored: {wedged} wedged");
+        assert!(wedged > 0, "no round wedged; the deferral test cannot tell a fix from luck");
+    }
+
+    /// No lost wakeups under contention. Exactly as many units are released
+    /// as consumers need, so a wake spent on a thread that never takes its
+    /// unit would leave a consumer parked forever: every consumer must
+    /// finish within the deadline. Thieves steal units with zero-timeout
+    /// waits and give them back, so woken waiters regularly lose the race.
+    #[test]
+    fn stress_budgeted_wakes_never_strand_a_waiter() {
+        setup();
+        const PER: u32 = 300;
+        let sem = create_semaphore(0, 100_000).unwrap();
+        let other = create_event(true, false).unwrap();
+        let alert = create_event(true, false).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let taken = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut consumers = Vec::new();
+        // 4 single-object consumers, 2 multi-object, 2 alertable (one is both).
+        for i in 0..7u32 {
+            let taken = taken.clone();
+            consumers.push(thread::spawn(move || {
+                for _ in 0..PER {
+                    // Consumer 4 returns on `other` and consumers 5 and 6 on
+                    // their alert whenever the toggler fires them; they
+                    // then wait again, having passed their wake on.
+                    loop {
+                        let (out, sem_index) = match i {
+                            4 => (wait_any(&[other, sem], 9600 + i, None, 0), 1),
+                            5 => (wait_any(&[sem, other], 9600 + i, None, alert), 0),
+                            6 => (wait_any(&[sem], 9600 + i, None, alert), 0),
+                            _ => (wait_any(&[sem], 9600 + i, None, 0), 0),
+                        };
+                        assert!(matches!(out, WaitOutcome::Signaled { .. }), "consumer {i}: {out:?}");
+                        if is_signaled(out, sem_index) {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    taken.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        let mut thieves = Vec::new();
+        for t in 0..2u32 {
+            let stop = stop.clone();
+            thieves.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if is_signaled(wait_any(&[sem], 9700 + t, Some(Duration::ZERO), 0), 0) {
+                        std::hint::spin_loop();
+                        sem_release(sem, 1).unwrap();
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for (t, ev) in [other, alert].into_iter().enumerate() {
+            let stop = stop.clone();
+            thieves.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    event_set(ev).unwrap();
+                    std::hint::spin_loop();
+                    event_reset(ev).unwrap();
+                    thread::sleep(Duration::from_micros(50 + 70 * t as u64));
+                }
+            }));
+        }
+        let total = PER * 7;
+        let mut released = 0;
+        let mut k = 0u32;
+        while released < total {
+            let n = (1 + k % 4).min(total - released);
+            sem_release(sem, n).unwrap();
+            released += n;
+            k += 1;
+            if k % 16 == 0 {
+                thread::sleep(Duration::from_micros(200));
+            }
+        }
+        let start = std::time::Instant::now();
+        while taken.load(Ordering::Relaxed) < total {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "lost wakeup: {} of {total} units taken, sem count {:?}, waiters {:?}",
+                taken.load(Ordering::Relaxed),
+                read_sem(sem),
+                test_waiter_counts(sem)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        for c in consumers {
+            c.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in thieves {
+            t.join().unwrap();
+        }
+        assert_eq!(read_sem(sem).unwrap().0, 0);
+        for h in [sem, other, alert] {
+            assert!(close(h));
+        }
+    }
+
+    /// Mutex and auto-reset event handoffs under contention: mutual
+    /// exclusion holds and nobody is left parked.
+    #[test]
+    fn stress_mutex_and_auto_event_handoff() {
+        setup();
+        let m = create_mutex(0, 0).unwrap();
+        let ev = create_event(false, false).unwrap();
+        let inside = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut joins = Vec::new();
+        for i in 0..6u32 {
+            let inside = inside.clone();
+            joins.push(thread::spawn(move || {
+                let me = 9800 + i;
+                for _ in 0..500 {
+                    assert!(is_signaled(wait_any(&[m], me, None, 0), 0));
+                    assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two mutex owners");
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                    mutex_unlock(m, me).unwrap();
+                }
+            }));
+        }
+        // Auto-event ping-pong: each consumer waits, the producer sets until
+        // every wait has been satisfied.
+        let got = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        for i in 0..4u32 {
+            let got = got.clone();
+            joins.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    assert!(is_signaled(wait_any(&[ev], 9900 + i, None, 0), 0));
+                    got.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        let start = std::time::Instant::now();
+        while got.load(Ordering::SeqCst) < 800 {
+            let _ = event_set(ev);
+            std::thread::yield_now();
+            assert!(start.elapsed() < Duration::from_secs(20), "auto-event waiter stranded at {}", got.load(Ordering::SeqCst));
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        for h in [m, ev] {
+            assert!(close(h));
+        }
+    }
+
     #[test]
     fn handle_zero_is_never_allocated() {
         setup();

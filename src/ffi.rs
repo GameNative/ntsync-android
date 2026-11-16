@@ -130,6 +130,14 @@ pub unsafe extern "C" fn ntsync_init(path: *const std::ffi::c_char) -> i32 {
     }
 }
 
+/// Install the host's per-thread lock-flag callback (NULL removes it). See
+/// ntsync_user.h for the protocol its SIGUSR1 handler must follow. Returns 0.
+#[no_mangle]
+pub extern "C" fn ntsync_set_lock_flag_hook(hook: Option<core::LockFlagHook>) -> i32 {
+    core::set_lock_flag_hook(hook);
+    0
+}
+
 /// Free all objects whose creator process no longer exists. Returns the
 /// number of freed objects, or a negative errno.
 #[no_mangle]

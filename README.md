@@ -47,10 +47,24 @@ mutex consistent.
   set this when the host process never installs a SIGUSR1 handler (i.e.
   not under Wine); it measurably reduces lock-path CPU under contention
   (~13% per-op in the multi-process benchmark).
+  A host that does install such a handler can avoid both syscalls with
+  `ntsync_set_lock_flag_hook` instead: the library sets a per-thread flag
+  the host owns while the thread holds the lock, the host's SIGUSR1 handler
+  marks the signal pending and returns while the flag is set, and the
+  library re-raises SIGUSR1 right after the unlock (protocol in
+  `include/ntsync_user.h`). Threads for which the hook returns NULL keep
+  the masking.
+- `NTSYNC_WAKE_ALL=1` — every signal op wakes all of an object's waiters
+  instead of only as many wait-any waiters as it made units available. Kept
+  for comparison; the default is cheaper for the releasing thread once its
+  wakes are issued after the unlock (see `sim_unity_release_cost`).
 - `NTSYNC_DEBUG=1` — log to stderr, stdout and `$TMPDIR/ntsync_debug.log`
   (the file is the reliable channel for in-game diagnostics); dump
   per-process stats every 10 s (waits, fast-path hits, lock acquisitions,
-  wake walks, signal→scheduled wake latency `wake_lat_cnt/us_sum/us_max`);
+  wake walks, signal→scheduled wake latency `wake_lat_cnt/us_sum/us_max`,
+  budgeted wakes that found nobody parked `wakes_unparked` and the second
+  walks that re-issued them `wake_rewalks`, SIGUSR1s held back by the
+  lock-flag hook `sigusr1_deferred`);
   emit a "stuck wait" dump with per-object state (including creator pid
   liveness) when a wait stalls.
 - Object lifetime: an object is reaped only when its creator **and every
